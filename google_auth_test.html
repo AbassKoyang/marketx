@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authentication Test Panel</title>
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            min-height: 100vh;
+            background-color: #f0f2f5;
+            margin: 0;
+            padding: 40px 20px;
+            box-sizing: border-box;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            max-width: 700px;
+            width: 100%;
+        }
+        h2 {
+            margin-top: 0;
+            color: #1a1a1a;
+        }
+        p {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .section {
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #e1e4e8;
+        }
+        .section:last-of-type {
+            border-bottom: none;
+        }
+        .btn-wrapper {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            background-color: #0d6efd;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+        button:hover { background-color: #0b5ed7; }
+        .btn-danger { background-color: #dc3545; }
+        .btn-danger:hover { background-color: #bb2d3b; }
+        .btn-secondary { background-color: #6c757d; }
+        .btn-secondary:hover { background-color: #5c636a; }
+        .btn-success { background-color: #198754; }
+        .btn-success:hover { background-color: #157347; }
+        
+        input {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        #response-container {
+            margin-top: 30px;
+            text-align: left;
+            background: #f8f9fa;
+            border: 1px solid #e1e4e8;
+            padding: 20px;
+            border-radius: 8px;
+            display: none;
+            overflow-x: auto;
+        }
+        #response-container h4 {
+            margin-top: 0;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin: 0;
+            font-size: 13px;
+            color: #d63384;
+            background-color: #fdf2f8;
+            padding: 12px;
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>Authentication Test Panel</h2>
+        <p>Test your Django JWT Cookie-based authentication endpoints.</p>
+        
+        <div class="section">
+            <h4>1. Login</h4>
+            <!-- Google Sign-In -->
+            <div class="btn-wrapper">
+                <div id="g_id_onload"
+                     data-client_id="865779507445-tilemf7h0v08hgmdjrgmv9e4dpgbs8kk.apps.googleusercontent.com"
+                     data-context="signin"
+                     data-ux_mode="popup"
+                     data-callback="handleCredentialResponse"
+                     data-auto_prompt="false">
+                </div>
+                <div class="g_id_signin" data-type="standard" data-shape="rectangular" data-theme="outline" data-text="signin_with" data-size="large" data-logo_alignment="left"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h4>2. Session Management</h4>
+            <div class="btn-wrapper">
+                <button class="btn-success" onclick="testEndpoint('auth/me/', 'GET')">Get My Profile (/me)</button>
+                <button class="btn-secondary" onclick="testEndpoint('auth/refresh/', 'POST')">Refresh Token</button>
+                <button class="btn-danger" onclick="testEndpoint('auth/logout/', 'POST')">Logout</button>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h4>3. Update User</h4>
+            <div class="btn-wrapper">
+                <input type="number" id="userId" placeholder="User ID" style="width: 80px;">
+                <input type="text" id="firstName" placeholder="First Name" style="width: 140px;">
+                <input type="text" id="lastName" placeholder="Last Name" style="width: 140px;">
+                <button class="btn-secondary" onclick="updateProfile()">Update Profile</button>
+            </div>
+        </div>
+
+        <div id="response-container">
+            <h4 id="response-title">Backend Response:</h4>
+            <pre id="response-output"></pre>
+        </div>
+    </div>
+
+    <!-- Google Identity Services Library -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <script>
+        // Make sure to access this page via localhost and not 127.0.0.1
+        const BASE_URL = 'http://localhost:8000/api/';
+
+        function showResponse(title, status, body) {
+            const container = document.getElementById('response-container');
+            const output = document.getElementById('response-output');
+            const titleEl = document.getElementById('response-title');
+            
+            container.style.display = 'block';
+            titleEl.textContent = title;
+            output.textContent = `Status Code: ${status}\n\n` + JSON.stringify(body, null, 2);
+        }
+
+        function handleCredentialResponse(response) {
+            const token = response.credential;
+            console.log("Encoded JWT ID token: " + token);
+            
+            showResponse('Google Login Response', 'Sending...', { token_snippet: token.substring(0, 30) + '...' });
+
+            fetch(BASE_URL + 'auth/google/', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ token: token })
+            })
+            .then(res => res.json().then(data => ({ status: res.status, body: data })))
+            .then(({ status, body }) => {
+                showResponse('POST /api/auth/google/', status, body);
+            })
+            .catch(error => {
+                showResponse('Error', 'FAILED', { error: error.message });
+            });
+        }
+
+        function testEndpoint(endpoint, method) {
+            showResponse(`${method} /api/${endpoint}`, 'Sending...', {});
+
+            fetch(BASE_URL + endpoint, {
+                method: method,
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(res => {
+                return res.text().then(text => {
+                    let data = {};
+                    try { 
+                        data = text ? JSON.parse(text) : {}; 
+                    } catch(e) { 
+                        data = text; 
+                    }
+                    return { status: res.status, body: data };
+                });
+            })
+            .then(({ status, body }) => {
+                showResponse(`${method} /api/${endpoint}`, status, body);
+            })
+            .catch(error => {
+                showResponse('Error', 'FAILED', { error: error.message });
+            });
+        }
+        
+        function updateProfile() {
+            const userId = document.getElementById('userId').value;
+            const firstName = document.getElementById('firstName').value;
+            const lastName = document.getElementById('lastName').value;
+            
+            if (!userId) {
+                alert("Please enter a User ID");
+                return;
+            }
+            
+            const endpoint = `auth/update/${userId}/`;
+            const payload = {};
+            if (firstName) payload.first_name = firstName;
+            if (lastName) payload.last_name = lastName;
+
+            showResponse(`PUT /api/${endpoint}`, 'Sending...', payload);
+
+            fetch(BASE_URL + endpoint, {
+                method: 'PUT',
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload)
+            })
+            .then(res => res.json().then(data => ({ status: res.status, body: data })))
+            .then(({ status, body }) => {
+                showResponse(`PUT /api/${endpoint}`, status, body);
+            })
+            .catch(error => {
+                showResponse('Error', 'FAILED', { error: error.message });
+            });
+        }
+    </script>
+</body>
+</html>
