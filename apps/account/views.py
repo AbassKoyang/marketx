@@ -11,6 +11,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from .models import User
 from .permissions import IsProfileOwner
 from .serializers import UserProfileSerializer
+from apps.wallet.services import get_or_create_wallet
 
 
 
@@ -42,6 +43,7 @@ def google_login(request):
             user.auth_provider = 'google'
             user.avatar = profile_pic_url
             user.save()
+            get_or_create_wallet(user, 10000)
             print("user_registered", user.id, email, "google")
         else:
             if user.auth_provider != 'google':
@@ -141,6 +143,16 @@ class MeView(generics.GenericAPIView):
 
     def get(self, request):
         serializer = self.get_serializer(request.user)
+        return Response(serializer.data)
+
+class OnboardingView(generics.GenericAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = UserProfileSerializer
+
+    def post(self, request):
+        serializer = self.get_serializer(request.user, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
         return Response(serializer.data)
 
 class CustomTokenObtainPairView(TokenObtainPairView):

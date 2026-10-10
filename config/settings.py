@@ -58,7 +58,8 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'apps.account',
-
+    'apps.wallet',
+    'apps.markets',
 ]
 
 AUTH_USER_MODEL = 'account.User'
