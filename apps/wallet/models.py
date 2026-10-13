@@ -14,6 +14,18 @@ class Wallet(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(available_balance__gte=0),
+                name="wallet_available_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(reserved_balance__gte=0),
+                name="wallet_reserved_nonnegative",
+            ),
+        ]
+
     def __str__(self):
         return f"Wallet for {self.user.username}"
 

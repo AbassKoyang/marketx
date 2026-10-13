@@ -83,6 +83,57 @@ def _record_entry(
     )
 
 
+def _mutate_wallet(
+    *,
+    user_id,
+    entry_type,
+    available_delta,
+    reserved_delta,
+    idempotency_key,
+    reference_type="",
+    reference_id="",
+    description="",
+):
+    if not idempotency_key:
+        raise ValidationError("An idempotency key is required.")
+
+    wallet = Wallet.objects.select_for_update().get(user_id=user_id)
+
+    existing = _get_existing_entry(
+        wallet,
+        entry_type=entry_type,
+        available_delta=available_delta,
+        reserved_delta=reserved_delta,
+        idempotency_key=idempotency_key,
+    )
+    if existing:
+        return wallet
+
+    next_available = wallet.available_balance + available_delta
+    next_reserved = wallet.reserved_balance + reserved_delta
+
+    if next_available < 0:
+        raise InsufficientAvailableCredits("Not enough available virtual credits.")
+    if next_reserved < 0:
+        raise InsufficientReservedCredits("Not enough reserved virtual credits.")
+
+    wallet.available_balance = next_available
+    wallet.reserved_balance = next_reserved
+    wallet.save(update_fields=["available_balance", "reserved_balance", "updated_at"])
+
+    _record_entry(
+        wallet=wallet,
+        entry_type=entry_type,
+        available_delta=available_delta,
+        reserved_delta=reserved_delta,
+        idempotency_key=idempotency_key,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        description=description,
+    )
+    return wallet
+
+
 @transaction.atomic
 def get_or_create_wallet(user, initial_credits=10_000):
     """
@@ -260,3 +311,50 @@ def release_reserved_credits(
     )
 
     return wallet
+
+
+@transaction.atomic
+def consume_reserved_credits(
+    *,
+    user_id,
+    amount,
+    idempotency_key,
+    reference_type="trade",
+    reference_id="",
+):
+    """Remove reserved credits after a BUY order execution spends them."""
+    _validate_amount(amount)
+    return _mutate_wallet(
+        user_id=user_id,
+        entry_type="reserved_spend",
+        available_delta=0,
+        reserved_delta=-amount,
+        idempotency_key=idempotency_key,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        description="Reserved credits spent on a trade",
+    )
+
+
+@transaction.atomic
+def credit_available_credits(
+    *,
+    user_id,
+    amount,
+    idempotency_key,
+    reference_type="trade",
+    reference_id="",
+    description="Virtual credits credited",
+):
+    """Credit available virtual credits for proceeds, payouts, or adjustments."""
+    _validate_amount(amount)
+    return _mutate_wallet(
+        user_id=user_id,
+        entry_type="available_credit",
+        available_delta=amount,
+        reserved_delta=0,
+        idempotency_key=idempotency_key,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        description=description,
+    )

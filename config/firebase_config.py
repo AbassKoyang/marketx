@@ -2,6 +2,9 @@ import firebase_admin
 from firebase_admin import credentials
 from django.conf import settings
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 _firebase_app = None
 
@@ -21,7 +24,7 @@ def initialize_firebase():
                     cred = credentials.Certificate(cred_path)
                     _firebase_app = firebase_admin.initialize_app(cred)
                 else:
-                    print("firebase_credentials_file_missing", cred_path=cred_path)
+                    logger.info("firebase_credentials_file_missing")
             
             elif hasattr(settings, 'FIREBASE_CREDENTIALS_JSON'):
                 import json
@@ -30,9 +33,9 @@ def initialize_firebase():
                 _firebase_app = firebase_admin.initialize_app(cred)
             
             else:
-                print("firebase_credentials_not_configured")
+                logger.info("firebase_credentials_not_configured")
                 
-        except Exception as e:
-            print("firebase_initialization_failed")
+        except Exception:
+            logger.exception("firebase_initialization_failed")
     
     return _firebase_app

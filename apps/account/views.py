@@ -1,4 +1,3 @@
-from django.shortcuts import render
 from django.conf import settings
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -23,7 +22,6 @@ from rest_framework.decorators import api_view, permission_classes, authenticati
 def google_login(request):
     token = request.data.get("token")
     if not token:
-        print("user_login_failed", "missing_google_token")
         return Response({"error": "Token not provided", "status": False}, status=status.HTTP_400_BAD_REQUEST)
     try:
         id_info = id_token.verify_oauth2_token(
@@ -44,16 +42,13 @@ def google_login(request):
             user.avatar = profile_pic_url
             user.save()
             get_or_create_wallet(user, 10000)
-            print("user_registered", user.id, email, "google")
         else:
             if user.auth_provider != 'google':
-                print("user_login_failed", email, "provider_mismatch")
                 return Response({
                     "error": "User needs to sign in through email",
                     "status": False
                 }, status=status.HTTP_403_FORBIDDEN)
 
-        print("user_login_success", user.id, user.email, "google")
         refresh = RefreshToken.for_user(user)
 
         response = Response({
@@ -83,7 +78,6 @@ def google_login(request):
 
         return response
     except ValueError:
-        print("user_login_failed", "invalid_google_token")
         return Response({"error": "Invalid token", "status": False}, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
@@ -192,12 +186,8 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 "message": "Token obtained successfully"
             }
 
-            print("Token obtain success", response.data)
-
             return response
-        else:
-            print("Token obtain failed", response.data)
-            return response
+        return response
 
 class CustomTokenRefreshView(TokenRefreshView):
     authentication_classes = ()
@@ -208,7 +198,6 @@ class CustomTokenRefreshView(TokenRefreshView):
         refresh_token = request.COOKIES.get("refresh_token")
 
         if not refresh_token:
-            print("Token refresh failed")
             return Response({"detail": "No refresh token"}, status=401)
 
         request.data["refresh"] = refresh_token
@@ -243,11 +232,7 @@ class CustomTokenRefreshView(TokenRefreshView):
                 "message": "Token refreshed successfully"
             }
 
-            print("Token refresh success", response.data)
-
             return response
-        else:
-            print("Token refresh failed", response.data)
-            return response
+        return response
         
     

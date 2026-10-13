@@ -27,6 +27,10 @@ class MarketCategory(models.Model):
 
 
 class Market(models.Model):
+    class MarketType(models.TextChoices):
+        BINARY = "binary", "Binary"
+        MULTI_OUTCOME = "multi_outcome", "Multi-outcome"
+
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
         OPEN = "open", "Open"
@@ -36,6 +40,12 @@ class Market(models.Model):
 
     title = models.CharField(max_length=180)
     slug = models.SlugField(max_length=200, unique=True, blank=True)
+    market_type = models.CharField(
+        max_length=20,
+        choices=MarketType.choices,
+        default=MarketType.BINARY,
+        db_index=True,
+    )
 
     question = models.CharField(max_length=255)
     description = models.TextField(blank=True)
@@ -60,6 +70,7 @@ class Market(models.Model):
 
     # Optional image for market discovery cards.
     image_url = models.URLField(blank=True)
+    image_public_id = models.CharField(max_length=255, blank=True)
 
     status = models.CharField(
         max_length=10,
@@ -138,22 +149,70 @@ class Market(models.Model):
         return self.question
 
 
-class MarketResolution(models.Model):
-    class Outcome(models.TextChoices):
-        YES = "yes", "Yes"
-        NO = "no", "No"
-        VOID = "void", "Void"
+class MarketOutcome(models.Model):
+    market = models.ForeignKey(
+        Market,
+        on_delete=models.PROTECT,
+        related_name="outcomes",
+    )
+    name = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=140)
+    description = models.CharField(max_length=255, blank=True)
+    image_url = models.URLField(blank=True)
+    display_order = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
 
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["display_order", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["market", "slug"],
+                name="market_outcome_unique_slug",
+            ),
+            models.UniqueConstraint(
+                fields=["market", "display_order"],
+                name="market_outcome_unique_order",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["market", "is_active"], name="outcome_market_active_idx"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.market_id and self.market.status != Market.Status.DRAFT:
+            original = MarketOutcome.objects.filter(pk=self.pk).first()
+            if original is None:
+                raise ValidationError("Outcomes can only be added while the market is draft.")
+            if original.slug != self.slug:
+                raise ValidationError("Outcome identity cannot change after draft.")
+
+    def save(self, *args, **kwargs):
+        if not self.slug and self.name:
+            self.slug = slugify(self.name)[:130].strip("-") or "outcome"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.market.title}: {self.name}"
+
+
+class MarketResolution(models.Model):
     market = models.OneToOneField(
         Market,
         on_delete=models.PROTECT,
         related_name="resolution",
     )
-
-    outcome = models.CharField(
-        max_length=4,
-        choices=Outcome.choices,
+    winning_outcome = models.ForeignKey(
+        MarketOutcome,
+        on_delete=models.PROTECT,
+        related_name="resolutions",
+        null=True,
+        blank=True,
     )
+    is_void = models.BooleanField(default=False)
 
     evidence_summary = models.TextField()
     evidence_url = models.URLField(blank=True)
@@ -169,6 +228,52 @@ class MarketResolution(models.Model):
 
     class Meta:
         ordering = ["-resolved_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(is_void=True, winning_outcome__isnull=True)
+                    | Q(is_void=False, winning_outcome__isnull=False)
+                ),
+                name="resolution_void_xor_winner",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.winning_outcome_id and self.winning_outcome.market_id != self.market_id:
+            raise ValidationError({
+                "winning_outcome": "Winning outcome must belong to the resolved market."
+            })
 
     def __str__(self):
-        return f"{self.market.title}: {self.get_outcome_display()}"
+        outcome = "Void" if self.is_void else self.winning_outcome
+        return f"{self.market.title}: {outcome}"
+
+
+class MarketPricePoint(models.Model):
+    outcome = models.ForeignKey(
+        MarketOutcome,
+        on_delete=models.CASCADE,
+        related_name="price_points",
+    )
+    price = models.PositiveIntegerField()
+    volume = models.PositiveBigIntegerField(default=0)
+    resolution_seconds = models.PositiveIntegerField(default=0)
+    timestamp = models.DateTimeField(db_index=True)
+    source_trade_id = models.PositiveBigIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["timestamp"]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(price__gte=0) & Q(price__lte=10000),
+                name="price_point_valid_price",
+            ),
+            models.UniqueConstraint(
+                fields=["outcome", "timestamp"],
+                name="price_point_unique_bucket",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["outcome", "timestamp"], name="price_point_outcome_time_idx"),
+        ]
