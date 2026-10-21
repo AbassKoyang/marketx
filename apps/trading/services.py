@@ -142,7 +142,7 @@ def _cancel_locked_order(order):
     order.cancelled_at = timezone.now()
     order.save(update_fields=["status", "cancelled_at", "updated_at"])
     _record_private_event(
-        user_id=user.id,
+        user_id=order.user_id,
         event_type="order_cancelled",
         outcome_id=order.outcome_id,
         payload={"order_id": order.id, "released_quantity": remaining},

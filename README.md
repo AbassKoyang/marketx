@@ -67,6 +67,10 @@ entries lazily; the database remains authoritative.
 
 Authentication routes remain under `/api/auth/`.
 
+For a frontend-agent-ready admin dashboard contract, including endpoint
+payloads, TanStack Query guidance, and shadcn/ui design direction, see
+[`docs/admin-dashboard-api-guide.md`](docs/admin-dashboard-api-guide.md).
+
 Market discovery:
 
 - `GET /api/categories/`

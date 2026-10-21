@@ -20,7 +20,6 @@ class MarketOutcomeSerializer(serializers.ModelSerializer):
             "slug",
             "description",
             "image_url",
-            "image_public_id",
             "display_order",
             "is_active",
         ]
@@ -59,6 +58,7 @@ class MarketSerializer(serializers.ModelSerializer):
             "resolution_source_description",
             "resolution_source_url",
             "image_url",
+            "image_public_id",
             "status",
             "opens_at",
             "closes_at",

@@ -24,4 +24,5 @@ urlpatterns = [
     path('api/', include('apps.markets.urls')),
     path('api/trading/', include('apps.trading.urls')),
     path('api/notifications/', include('apps.notifications.urls')),
+    path('api/admin/', include('apps.adminpanel.urls')),
 ]

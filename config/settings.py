@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     'apps.markets',
     'apps.trading',
     'apps.notifications',
+    'apps.adminpanel',
 ]
 
 AUTH_USER_MODEL = 'account.User'
