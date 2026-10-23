@@ -1,3 +1,6 @@
+import re
+import uuid
+
 from django.conf import settings
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -38,6 +41,23 @@ def _clear_session_hint(response):
     response.delete_cookie(key=SESSION_HINT_COOKIE, samesite="None", path="/")
     return response
 
+
+def _unique_google_username(email):
+    """Build a readable, unique username for a new Google account.
+
+    The username is only a placeholder until onboarding.
+    """
+    local_part = (email or "").split("@", 1)[0]
+    base = re.sub(r"[^a-zA-Z0-9_]", "", local_part).lower()[:20] or "trader"
+    if len(base) < 3:
+        base = f"user_{base}"
+
+    candidate = base
+    while User.objects.filter(username=candidate).exists():
+        candidate = f"{base[:23]}_{uuid.uuid4().hex[:6]}"
+    return candidate
+
+
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
@@ -55,21 +75,25 @@ def google_login(request):
         first_name = id_info.get('given_name', '')
         last_name = id_info.get('family_name', '')
         profile_pic_url = id_info.get('picture', '')
-        user, created = User.objects.get_or_create(email=email)
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={
+                "username": _unique_google_username(email),
+                "first_name": first_name,
+                "last_name": last_name,
+                "auth_provider": "google",
+                "avatar": profile_pic_url,
+            },
+        )
         if created:
             user.set_unusable_password()
-            user.first_name = first_name
-            user.last_name = last_name
-            user.auth_provider = 'google'
-            user.avatar = profile_pic_url
             user.save()
             get_or_create_wallet(user, 10000)
-        else:
-            if user.auth_provider != 'google':
-                return Response({
-                    "error": "User needs to sign in through email",
-                    "status": False
-                }, status=status.HTTP_403_FORBIDDEN)
+        elif user.auth_provider != 'google':
+            return Response({
+                "error": "User needs to sign in through email",
+                "status": False
+            }, status=status.HTTP_403_FORBIDDEN)
 
         refresh = RefreshToken.for_user(user)
 

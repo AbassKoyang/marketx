@@ -113,9 +113,9 @@ def _mutate_wallet(
     next_reserved = wallet.reserved_balance + reserved_delta
 
     if next_available < 0:
-        raise InsufficientAvailableCredits("Not enough available virtual credits.")
+        raise InsufficientAvailableCredits("Not enough available credits.")
     if next_reserved < 0:
-        raise InsufficientReservedCredits("Not enough reserved virtual credits.")
+        raise InsufficientReservedCredits("Not enough reserved credits.")
 
     wallet.available_balance = next_available
     wallet.reserved_balance = next_reserved
@@ -180,7 +180,7 @@ def get_or_create_wallet(user, initial_credits=10_000):
         available_delta=initial_credits,
         reserved_delta=0,
         idempotency_key=key,
-        description="Initial MarketX virtual credit allocation",
+        description="Initial credit allocation",
     )
 
     return wallet
@@ -198,7 +198,7 @@ def reserve_credits(
     """
     Move credits from available to reserved.
 
-    Use for BUY orders that need virtual credits to be held.
+    Use for BUY orders that need credits to be held.
     This does not apply to reserving YES/NO contracts for SELL orders.
     """
     _validate_amount(amount)
@@ -223,7 +223,7 @@ def reserve_credits(
 
     if wallet.available_balance < amount:
         raise InsufficientAvailableCredits(
-            "Not enough available virtual credits."
+            "Not enough available credits."
         )
 
     wallet.available_balance -= amount
@@ -286,7 +286,7 @@ def release_reserved_credits(
 
     if wallet.reserved_balance < amount:
         raise InsufficientReservedCredits(
-            "Not enough reserved virtual credits to release."
+            "Not enough reserved credits to release."
         )
 
     wallet.reserved_balance -= amount
@@ -344,9 +344,9 @@ def credit_available_credits(
     idempotency_key,
     reference_type="trade",
     reference_id="",
-    description="Virtual credits credited",
+    description="Credits added",
 ):
-    """Credit available virtual credits for proceeds, payouts, or adjustments."""
+    """Credit available credits for proceeds, payouts, or adjustments."""
     _validate_amount(amount)
     return _mutate_wallet(
         user_id=user_id,

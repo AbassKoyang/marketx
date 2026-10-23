@@ -77,6 +77,7 @@ AUTH_USER_MODEL = 'account.User'
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware', 
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -108,15 +109,23 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASE_URL = config("DATABASE_URL", default="")
-if DATABASE_URL:
-    import dj_database_url
-
+PGDATABASE = config("PGDATABASE", default="")
+if PGDATABASE:
     DATABASES = {
-        "default": dj_database_url.parse(
-            DATABASE_URL,
-            conn_max_age=60,
-        )
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": PGDATABASE,
+            "USER": config("PGUSER"),
+            "PASSWORD": config("PGPASSWORD"),
+            "HOST": config("PGHOST"),
+            "PORT": config("PGPORT", default=5432, cast=int),
+            "CONN_MAX_AGE": 60,
+            "OPTIONS": {
+                "sslmode": "require",
+                "channel_binding": "require",
+                "connect_timeout": 10,
+            },
+        }
     }
 else:
     DATABASES = {
