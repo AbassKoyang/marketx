@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Max, Min, Sum
+from django.db.models import Max, Min, OuterRef, Prefetch, Subquery, Sum
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -52,11 +52,21 @@ class MarketViewSet(viewsets.ModelViewSet):
     lookup_field = "slug"
 
     def get_queryset(self):
+        latest_price = (
+            MarketPricePoint.objects.filter(outcome=OuterRef("pk"))
+            .order_by("-timestamp")
+            .values("price")[:1]
+        )
+        outcomes = MarketOutcome.objects.annotate(
+            latest_price_value=Subquery(latest_price)
+        ).order_by("display_order", "id")
         queryset = (
-            Market.objects.select_related("category", "created_by")
-            .prefetch_related("outcomes")
+            Market.objects.select_related("category", "created_by", "resolution")
+            .prefetch_related(Prefetch("outcomes", queryset=outcomes))
             .all()
         )
+        if not (self.request.user and self.request.user.is_staff):
+            queryset = queryset.exclude(status=Market.Status.DRAFT)
         status_value = self.request.query_params.get("status")
         category = self.request.query_params.get("category")
         market_type = self.request.query_params.get("market_type")
@@ -160,7 +170,10 @@ class MarketOutcomeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffOrReadOnly]
 
     def get_queryset(self):
-        return MarketOutcome.objects.select_related("market").filter(is_active=True)
+        queryset = MarketOutcome.objects.select_related("market").filter(is_active=True)
+        if not (self.request.user and self.request.user.is_staff):
+            queryset = queryset.exclude(market__status=Market.Status.DRAFT)
+        return queryset
 
     @action(detail=True, methods=["get"])
     def history(self, request, pk=None):

@@ -11,6 +11,8 @@ class MarketCategorySerializer(serializers.ModelSerializer):
 
 
 class MarketOutcomeSerializer(serializers.ModelSerializer):
+    latest_price = serializers.SerializerMethodField()
+
     class Meta:
         model = MarketOutcome
         fields = [
@@ -22,7 +24,15 @@ class MarketOutcomeSerializer(serializers.ModelSerializer):
             "image_url",
             "display_order",
             "is_active",
+            "latest_price",
         ]
+
+    def get_latest_price(self, obj):
+        annotated = getattr(obj, "latest_price_value", None)
+        if annotated is not None:
+            return annotated
+        point = obj.price_points.order_by("-timestamp").values_list("price", flat=True).first()
+        return point
 
     def validate(self, attrs):
         market = attrs.get("market") or getattr(self.instance, "market", None)
@@ -42,6 +52,7 @@ class MarketSerializer(serializers.ModelSerializer):
         write_only=True,
     )
     outcomes = MarketOutcomeSerializer(many=True, read_only=True)
+    resolution = serializers.SerializerMethodField()
 
     class Meta:
         model = Market
@@ -65,10 +76,23 @@ class MarketSerializer(serializers.ModelSerializer):
             "resolution_deadline",
             "is_featured",
             "outcomes",
+            "resolution",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["status", "image_url", "image_public_id", "created_at", "updated_at"]
+
+    def get_resolution(self, obj):
+        resolution = getattr(obj, "resolution", None)
+        if resolution is None:
+            return None
+        return {
+            "winning_outcome": resolution.winning_outcome_id,
+            "is_void": resolution.is_void,
+            "evidence_summary": resolution.evidence_summary,
+            "evidence_url": resolution.evidence_url,
+            "resolved_at": resolution.resolved_at,
+        }
 
 
 class MarketPricePointSerializer(serializers.ModelSerializer):

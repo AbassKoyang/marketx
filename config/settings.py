@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 
 from pathlib import Path
 import os
+from celery.schedules import crontab
 from decouple import config
 from datetime import timedelta
 
@@ -201,6 +202,12 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
 
 CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND", default="redis://localhost:6379/1")
+CELERY_BEAT_SCHEDULE = {
+    "close-expired-markets": {
+        "task": "apps.trading.tasks.close_expired_markets",
+        "schedule": crontab(minute="*"),
+    },
+}
 CACHE_URL = config("CACHE_URL", default="")
 if CACHE_URL:
     CACHES = {

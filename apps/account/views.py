@@ -16,6 +16,28 @@ from apps.wallet.services import get_or_create_wallet
 
 from rest_framework.decorators import api_view, permission_classes, authentication_classes
 
+SESSION_HINT_COOKIE = "marketx_session"
+
+
+def _set_session_hint(response):
+    """Non-sensitive, readable hint so the browser only attempts a token
+    refresh when a session cookie is likely to exist."""
+    response.set_cookie(
+        key=SESSION_HINT_COOKIE,
+        value="1",
+        httponly=False,
+        secure=True,
+        samesite="None",
+        max_age=(60 * 60 * 24) * 7,
+        path="/",
+    )
+    return response
+
+
+def _clear_session_hint(response):
+    response.delete_cookie(key=SESSION_HINT_COOKIE, samesite="None", path="/")
+    return response
+
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
@@ -76,6 +98,7 @@ def google_login(request):
             path='/'
         )
 
+        _set_session_hint(response)
         return response
     except ValueError:
         return Response({"error": "Invalid token", "status": False}, status=status.HTTP_400_BAD_REQUEST)
@@ -95,6 +118,7 @@ def logout(request):
     response.delete_cookie(key="refresh_token",
                            samesite="None",
                            path='/')
+    _clear_session_hint(response)
     return response
 
 class ListUsersView(generics.ListAPIView):
@@ -144,10 +168,13 @@ class OnboardingView(generics.GenericAPIView):
     serializer_class = UserProfileSerializer
 
     def post(self, request):
-        serializer = self.get_serializer(request.user, data=request.data)
+        serializer = self.get_serializer(request.user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data)
+        user = serializer.save()
+        if user.first_name and user.last_name and user.username:
+            user.is_onboarded = True
+            user.save(update_fields=["is_onboarded", "updated_at"])
+        return Response(UserProfileSerializer(user).data)
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     authentication_classes = ()
@@ -186,6 +213,7 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 "message": "Token obtained successfully"
             }
 
+            _set_session_hint(response)
             return response
         return response
 
@@ -232,6 +260,7 @@ class CustomTokenRefreshView(TokenRefreshView):
                 "message": "Token refreshed successfully"
             }
 
+            _set_session_hint(response)
             return response
         return response
         

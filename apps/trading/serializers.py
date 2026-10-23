@@ -5,7 +5,26 @@ from .constants import CREDIT_SCALE, MAX_PRICE, MIN_PRICE
 from .models import ActivityEvent, Order, Position, Trade
 
 
-class OrderSerializer(serializers.ModelSerializer):
+class OutcomeContextMixin(serializers.Serializer):
+    outcome_name = serializers.SerializerMethodField()
+    market_id = serializers.SerializerMethodField()
+    market_title = serializers.SerializerMethodField()
+    market_slug = serializers.SerializerMethodField()
+
+    def get_outcome_name(self, obj):
+        return obj.outcome.name if obj.outcome_id else None
+
+    def get_market_id(self, obj):
+        return obj.outcome.market_id if obj.outcome_id else None
+
+    def get_market_title(self, obj):
+        return obj.outcome.market.title if obj.outcome_id else None
+
+    def get_market_slug(self, obj):
+        return obj.outcome.market.slug if obj.outcome_id else None
+
+
+class OrderSerializer(OutcomeContextMixin, serializers.ModelSerializer):
     remaining_quantity = serializers.IntegerField(read_only=True)
 
     class Meta:
@@ -13,6 +32,10 @@ class OrderSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "outcome",
+            "outcome_name",
+            "market_id",
+            "market_title",
+            "market_slug",
             "side",
             "limit_price",
             "original_quantity",
@@ -35,7 +58,7 @@ class SubmitOrderSerializer(serializers.Serializer):
     client_order_id = serializers.CharField(max_length=100)
 
 
-class TradeSerializer(serializers.ModelSerializer):
+class TradeSerializer(OutcomeContextMixin, serializers.ModelSerializer):
     price_decimal = serializers.SerializerMethodField()
 
     class Meta:
@@ -44,6 +67,10 @@ class TradeSerializer(serializers.ModelSerializer):
             "id",
             "execution_id",
             "outcome",
+            "outcome_name",
+            "market_id",
+            "market_title",
+            "market_slug",
             "price",
             "price_decimal",
             "quantity",
@@ -55,19 +82,29 @@ class TradeSerializer(serializers.ModelSerializer):
         return obj.price / CREDIT_SCALE
 
 
-class PositionSerializer(serializers.ModelSerializer):
+class PositionSerializer(OutcomeContextMixin, serializers.ModelSerializer):
     average_entry_price = serializers.SerializerMethodField()
+    last_price = serializers.SerializerMethodField()
+    market_status = serializers.SerializerMethodField()
+    market_closes_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Position
         fields = [
             "id",
             "outcome",
+            "outcome_name",
+            "market_id",
+            "market_title",
+            "market_slug",
+            "market_status",
+            "market_closes_at",
             "quantity",
             "reserved_quantity",
             "cost_basis",
             "realized_pnl",
             "average_entry_price",
+            "last_price",
             "settled_at",
             "updated_at",
         ]
@@ -78,9 +115,36 @@ class PositionSerializer(serializers.ModelSerializer):
             return None
         return (obj.cost_basis / obj.quantity) / CREDIT_SCALE
 
+    def get_last_price(self, obj):
+        annotated = getattr(obj, "latest_price", None)
+        if annotated is not None:
+            return annotated
+        return (
+            obj.outcome.price_points.order_by("-timestamp")
+            .values_list("price", flat=True)
+            .first()
+        )
 
-class ActivityEventSerializer(serializers.ModelSerializer):
+    def get_market_status(self, obj):
+        return obj.outcome.market.status if obj.outcome_id else None
+
+    def get_market_closes_at(self, obj):
+        return obj.outcome.market.closes_at if obj.outcome_id else None
+
+
+class ActivityEventSerializer(OutcomeContextMixin, serializers.ModelSerializer):
     class Meta:
         model = ActivityEvent
-        fields = ["id", "event_type", "visibility", "outcome", "payload", "created_at"]
+        fields = [
+            "id",
+            "event_type",
+            "visibility",
+            "outcome",
+            "outcome_name",
+            "market_id",
+            "market_title",
+            "market_slug",
+            "payload",
+            "created_at",
+        ]
         read_only_fields = fields
