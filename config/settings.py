@@ -111,7 +111,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 PGDATABASE = config("PGDATABASE", default="")
-if DEBUG:
+if not DEBUG:
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
@@ -221,7 +221,7 @@ if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
         secure=True,
     )
 
-if not DEBUG:
+if DEBUG:
     CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://127.0.0.1:6379/0')
     CELERY_RESULT_BACKEND = config('CELERY_BROKER_URL', default='redis://127.0.0.1:6379/0')
 else:
@@ -266,7 +266,7 @@ else:
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = '/static/'
-if DEBUG:
+if not DEBUG:
     STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
     STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 MEDIA_URL = '/media/'
