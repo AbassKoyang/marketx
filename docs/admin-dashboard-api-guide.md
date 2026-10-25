@@ -44,10 +44,14 @@ Important domain rules:
 - Prices are integer ticks from `1` to `9999`.
 - A winning contract pays `10000` units.
 - Quantities are whole contracts.
-- Trades execute at the resting order price.
+- Trades between users execute at the resting order price; primary-issuance
+  fills execute at the buyer's limit price.
 - BUY orders reserve `limit_price * quantity`.
 - SELL orders reserve existing position quantity. Naked short selling is not
   supported.
+- A BUY with no crossing resting SELL is filled by primary issuance: the
+  platform liquidity account mints a complete set and sells the requested
+  outcome to the buyer. `issuance_limit` caps minted sets per market.
 - PostgreSQL/Django ORM records are authoritative. UI caches are never
   authoritative.
 
@@ -194,6 +198,8 @@ export type Market = {
   closes_at: string
   resolution_deadline: string
   is_featured: boolean
+  issuance_limit: number
+  issued_quantity: number
   outcomes: MarketOutcome[]
   created_at: string
   updated_at: string
@@ -543,6 +549,9 @@ Notes:
 
 - `status` is read-only through this serializer. New markets start as `draft`.
 - `created_by` is inferred from the authenticated admin.
+- `issuance_limit` and `issued_quantity` are read-only. The limit is the
+  maximum number of complete sets the liquidity account may mint for this
+  market, and `issued_quantity` is how many have been minted so far.
 - Add outcomes separately before publishing.
 
 Frontend usage:

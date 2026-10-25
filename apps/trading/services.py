@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 
 from django.core.exceptions import ValidationError
@@ -6,6 +7,7 @@ from django.db.models import ExpressionWrapper, F, Q, Sum, BigIntegerField
 from django.utils import timezone
 
 from apps.markets.models import Market, MarketOutcome, MarketPricePoint, MarketResolution
+from apps.wallet.models import Wallet
 from apps.wallet.services import (
     consume_reserved_credits,
     credit_available_credits,
@@ -13,6 +15,7 @@ from apps.wallet.services import (
     reserve_credits,
 )
 from .constants import CREDIT_SCALE, MAX_PRICE, MIN_PRICE
+from .house import get_house_user
 from .models import ActivityEvent, Order, Position, Settlement, Trade
 
 
@@ -207,6 +210,14 @@ def _candidate_order(incoming):
     )
 
 
+def _apply_fill(order, quantity):
+    order.filled_quantity = F("filled_quantity") + quantity
+    order.save(update_fields=["filled_quantity", "updated_at"])
+    order.refresh_from_db()
+    _set_order_fill_state(order)
+    order.save(update_fields=["status", "updated_at"])
+
+
 def _match_order(order_id):
     incoming = (
         Order.objects.select_for_update()
@@ -255,13 +266,182 @@ def _match_order(order_id):
             payload={"trade_id": trade.id, "order_id": sell_order.id, "quantity": quantity, "price": price},
         )
         _apply_trade(trade)
+        _apply_fill(incoming, quantity)
+        _apply_fill(resting, quantity)
 
-        for order in (incoming, resting):
-            order.filled_quantity = F("filled_quantity") + quantity
-            order.save(update_fields=["filled_quantity", "updated_at"])
-            order.refresh_from_db()
-            _set_order_fill_state(order)
-            order.save(update_fields=["status", "updated_at"])
+    # Primary issuance: if no user is selling, the platform mints a complete
+    # set and sells the requested outcome to the buyer. This is what makes the
+    # first trade possible; the house keeps the complementary shares.
+    if (
+        incoming.side == Order.Side.BUY
+        and incoming.is_open_for_matching
+        and incoming.remaining_quantity > 0
+    ):
+        _issue_to_buyer(incoming)
+
+
+def _issue_to_buyer(incoming):
+    """
+    Sell shares to a buyer by minting complete sets.
+
+    Each minted set adds one share of every active outcome. The buyer pays for
+    the outcome they want; the platform keeps the others. CREDIT_SCALE credits
+    are reserved per set, so settlement payouts are always fully collateralized.
+    Existing house inventory is sold before minting new sets.
+
+    Returns the number of shares issued.
+    """
+    market = Market.objects.select_for_update().get(
+        pk=incoming.outcome.market_id
+    )
+    if market.status != Market.Status.OPEN:
+        return 0
+
+    now = timezone.now()
+    if market.opens_at > now or market.closes_at <= now:
+        return 0
+
+    # Outcome rows are immutable while a market is open, and the market lock
+    # above already serializes issuance for this market. Do not lock every
+    # outcome row here: doing so can deadlock against order submission, which
+    # locks a single outcome before taking the market lock.
+    outcomes = list(
+        MarketOutcome.objects.filter(market=market, is_active=True).order_by(
+            "display_order", "id"
+        )
+    )
+    # A complete set needs at least two outcomes to have a well-defined payout.
+    if len(outcomes) < 2:
+        return 0
+
+    outcome = next((item for item in outcomes if item.pk == incoming.outcome_id), None)
+    if outcome is None:
+        return 0
+
+    house = get_house_user()
+    house_wallet = Wallet.objects.select_for_update().get(user=house)
+    house_positions = {
+        position.outcome_id: position
+        for position in Position.objects.select_for_update().filter(
+            user=house, outcome__in=outcomes
+        )
+    }
+
+    inventory = house_positions.get(outcome.id)
+    inventory_available = (
+        max(0, inventory.quantity - inventory.reserved_quantity)
+        if inventory
+        else 0
+    )
+
+    remaining_sets = max(0, market.issuance_limit - market.issued_quantity)
+    affordable_sets = house_wallet.available_balance // CREDIT_SCALE
+    mint_quantity = min(
+        max(0, incoming.remaining_quantity - inventory_available),
+        remaining_sets,
+        affordable_sets,
+    )
+    fill_quantity = min(
+        incoming.remaining_quantity,
+        inventory_available + mint_quantity,
+    )
+    if fill_quantity <= 0:
+        return 0
+
+    price = incoming.limit_price
+    if mint_quantity:
+        reserve_credits(
+            user_id=house.id,
+            amount=CREDIT_SCALE * mint_quantity,
+            idempotency_key=f"issuance-collateral:{incoming.id}:{uuid.uuid4().hex}",
+            reference_type="market",
+            reference_id=market.id,
+        )
+        _mint_house_positions(
+            house=house,
+            house_positions=house_positions,
+            outcomes=outcomes,
+            sold_outcome=outcome,
+            mint_quantity=mint_quantity,
+            price=price,
+        )
+        market.issued_quantity += mint_quantity
+        market.save(update_fields=["issued_quantity", "updated_at"])
+
+    sold_position = house_positions[outcome.id]
+    sold_position.reserved_quantity += fill_quantity
+    sold_position.save(update_fields=["reserved_quantity", "updated_at"])
+
+    house_order = Order.objects.create(
+        user=house,
+        outcome=outcome,
+        side=Order.Side.SELL,
+        limit_price=price,
+        original_quantity=fill_quantity,
+        client_order_id=f"issuance:{uuid.uuid4().hex}",
+    )
+    trade = Trade.objects.create(
+        outcome=outcome,
+        buy_order=incoming,
+        sell_order=house_order,
+        buyer_id=incoming.user_id,
+        seller=house,
+        price=price,
+        quantity=fill_quantity,
+    )
+    _record_public_event(
+        event_type="trade_executed",
+        outcome_id=trade.outcome_id,
+        payload={
+            "trade_id": trade.id,
+            "price": trade.price,
+            "quantity": trade.quantity,
+            "issuance": mint_quantity > 0,
+        },
+    )
+    _record_private_event(
+        user_id=incoming.user_id,
+        event_type="order_filled",
+        outcome_id=trade.outcome_id,
+        payload={
+            "trade_id": trade.id,
+            "order_id": incoming.id,
+            "quantity": fill_quantity,
+            "price": price,
+        },
+    )
+    _apply_trade(trade)
+    _apply_fill(house_order, fill_quantity)
+    _apply_fill(incoming, fill_quantity)
+    return fill_quantity
+
+
+def _mint_house_positions(
+    *, house, house_positions, outcomes, sold_outcome, mint_quantity, price
+):
+    """Increase the house inventory by one share of every outcome per set."""
+    sold_basis = price * mint_quantity
+    complement_basis = CREDIT_SCALE * mint_quantity - sold_basis
+    complements = [item for item in outcomes if item.pk != sold_outcome.pk]
+    share, remainder = divmod(complement_basis, len(complements))
+
+    def position_for(item):
+        position = house_positions.get(item.id)
+        if position is None:
+            position = Position.objects.create(user=house, outcome=item)
+            house_positions[item.id] = position
+        return position
+
+    for index, item in enumerate(complements):
+        position = position_for(item)
+        position.quantity += mint_quantity
+        position.cost_basis += share + (1 if index < remainder else 0)
+        position.save(update_fields=["quantity", "cost_basis", "updated_at"])
+
+    sold_position = position_for(sold_outcome)
+    sold_position.quantity += mint_quantity
+    sold_position.cost_basis += sold_basis
+    sold_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
 
 
 def _apply_trade(trade):
@@ -385,6 +565,22 @@ def resolve_market(*, market_id, winning_outcome_id=None, is_void=False, resolve
 def settle_market(*, market_id):
     market = Market.objects.select_for_update().get(pk=market_id)
     resolution = market.resolution
+
+    if market.issued_quantity:
+        house = get_house_user()
+        collateral = CREDIT_SCALE * market.issued_quantity
+        # Each minted set is backed by CREDIT_SCALE of reserved collateral and
+        # pays exactly CREDIT_SCALE to the winning outcome. Consuming it funds
+        # resolved payouts in full and covers the base cost basis on a void
+        # market; refunds above that remain platform-funded, as before.
+        consume_reserved_credits(
+            user_id=house.id,
+            amount=collateral,
+            idempotency_key=f"issuance-collateral-settle:{market.id}",
+            reference_type="market",
+            reference_id=market.id,
+        )
+
     positions = (
         Position.objects.select_for_update()
         .filter(outcome__market=market, settled_at__isnull=True)

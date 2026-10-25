@@ -41,6 +41,17 @@ class MarketOutcomeSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Outcomes can only be added while the market is draft.")
             if "slug" in attrs and attrs["slug"] != self.instance.slug:
                 raise serializers.ValidationError("Outcome slug cannot change after draft.")
+        if (
+            self.instance is not None
+            and "is_active" in attrs
+            and attrs["is_active"] != self.instance.is_active
+            and Market.objects.filter(
+                pk=self.instance.market_id, issued_quantity__gt=0
+            ).exists()
+        ):
+            raise serializers.ValidationError(
+                "Outcomes cannot be activated or deactivated after share issuance has started."
+            )
         return attrs
 
 
@@ -75,12 +86,22 @@ class MarketSerializer(serializers.ModelSerializer):
             "closes_at",
             "resolution_deadline",
             "is_featured",
+            "issuance_limit",
+            "issued_quantity",
             "outcomes",
             "resolution",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["status", "image_url", "image_public_id", "created_at", "updated_at"]
+        read_only_fields = [
+            "status",
+            "image_url",
+            "image_public_id",
+            "issuance_limit",
+            "issued_quantity",
+            "created_at",
+            "updated_at",
+        ]
 
     def get_resolution(self, obj):
         resolution = getattr(obj, "resolution", None)

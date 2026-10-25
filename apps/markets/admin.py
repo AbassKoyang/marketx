@@ -10,10 +10,20 @@ class MarketOutcomeInline(admin.TabularInline):
 
 @admin.register(Market)
 class MarketAdmin(admin.ModelAdmin):
-    list_display = ("title", "market_type", "status", "category", "closes_at", "is_featured")
+    list_display = (
+        "title",
+        "market_type",
+        "status",
+        "category",
+        "closes_at",
+        "is_featured",
+        "issued_quantity",
+        "issuance_limit",
+    )
     list_filter = ("status", "market_type", "category", "is_featured")
     search_fields = ("title", "question")
     prepopulated_fields = {"slug": ("title",)}
+    readonly_fields = ("issued_quantity",)
     inlines = [MarketOutcomeInline]
 
 

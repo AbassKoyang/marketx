@@ -244,6 +244,18 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(minute="*"),
     },
 }
+
+# Platform liquidity account used by the matching engine to mint complete sets.
+# Every minted set is backed by CREDIT_SCALE credits of reserved collateral.
+MARKETX_HOUSE_EMAIL = config(
+    "MARKETX_HOUSE_EMAIL", default="liquidity@marketx.local"
+)
+MARKETX_HOUSE_USERNAME = config(
+    "MARKETX_HOUSE_USERNAME", default="marketx-liquidity"
+)
+MARKETX_HOUSE_CREDITS = config(
+    "MARKETX_HOUSE_CREDITS", default=100_000_000, cast=int
+)
 CACHE_URL = config("CACHE_URL", default="")
 if CACHE_URL:
     CACHES = {

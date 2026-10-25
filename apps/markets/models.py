@@ -85,6 +85,12 @@ class Market(models.Model):
 
     is_featured = models.BooleanField(default=False)
 
+    # Primary issuance: the platform liquidity account mints complete sets on
+    # demand so buyers can trade before any user-owned shares exist. Each set
+    # is backed by CREDIT_SCALE credits of collateral.
+    issuance_limit = models.PositiveBigIntegerField(default=10_000)
+    issued_quantity = models.PositiveBigIntegerField(default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -111,6 +117,10 @@ class Market(models.Model):
                 ),
                 name="market_deadline_after_close",
             ),
+            models.CheckConstraint(
+                condition=Q(issued_quantity__lte=models.F("issuance_limit")),
+                name="market_issued_within_limit",
+            ),
         ]
 
     def clean(self):
@@ -128,6 +138,13 @@ class Market(models.Model):
                     "resolution_deadline":
                         "The resolution deadline cannot precede closing."
                 })
+
+        if self.issuance_limit < self.issued_quantity:
+            raise ValidationError({
+                "issuance_limit":
+                    "The issuance limit cannot be lower than the quantity "
+                    "already issued."
+            })
 
     def save(self, *args, **kwargs):
         if not self.slug and self.title:
@@ -189,6 +206,24 @@ class MarketOutcome(models.Model):
                 raise ValidationError("Outcomes can only be added while the market is draft.")
             if original.slug != self.slug:
                 raise ValidationError("Outcome identity cannot change after draft.")
+
+        if self.pk and self.market_id:
+            previous_active = (
+                MarketOutcome.objects.filter(pk=self.pk)
+                .values_list("is_active", flat=True)
+                .first()
+            )
+            if (
+                previous_active is not None
+                and previous_active != self.is_active
+                and Market.objects.filter(
+                    pk=self.market_id, issued_quantity__gt=0
+                ).exists()
+            ):
+                raise ValidationError(
+                    "Outcomes cannot be activated or deactivated after share "
+                    "issuance has started."
+                )
 
     def save(self, *args, **kwargs):
         if not self.slug and self.name:

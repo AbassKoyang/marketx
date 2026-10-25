@@ -42,6 +42,19 @@ limit, the excess reservation for that fill is released immediately. SELL
 orders reserve existing position quantity, so naked short selling is not
 supported.
 
+Markets do not need a pre-existing seller. When a BUY cannot be filled by a
+resting SELL, the platform liquidity account mints a complete set: one share of
+every active outcome. The buyer receives the requested outcome at their limit
+price and the liquidity account keeps the complementary shares. Each minted set
+reserves `CREDIT_SCALE` credits of collateral in the liquidity wallet, so every
+winning payout is fully funded. Existing liquidity inventory is sold before new
+sets are minted, and `Market.issuance_limit` caps sets per market.
+
+On resolution, the reserved issuance collateral funds the winning payouts. On a
+void market it funds cost-basis refunds. Because complete sets pay exactly
+`CREDIT_SCALE` when they win, resolved payouts never create credits; any void
+refund above the reserved collateral is platform-funded, as before.
+
 Wallet balances are mutated only through wallet services and ledger entries.
 Ledger rows are immutable audit records with unique idempotency keys. Critical
 trading operations use `transaction.atomic()` and row locks around orders,
@@ -56,6 +69,8 @@ price-time priority:
 - incoming sells match the highest priced resting buys at or above the sell
   limit;
 - orders at the same price are matched by creation time and primary key;
+- a BUY that still has quantity left is filled by primary issuance, so the
+  first trade in a market can happen without any seller;
 - partial fills update remaining quantities and keep the unfilled order open;
 - cancellations release unfilled BUY reservations or SELL reserved quantity.
 
@@ -126,12 +141,26 @@ python manage.py reconcile_marketx
 It reports wallet-ledger mismatches, order-fill mismatches, and reserved
 position discrepancies. It does not mutate data.
 
+## Tests
+
+```powershell
+$env:DJANGO_SETTINGS_MODULE = "config.settings_test_sqlite"
+python manage.py test
+```
+
+`config.settings_test_sqlite` runs the suite against an isolated in-memory
+SQLite database, so the configured PostgreSQL database is left untouched.
+
 ## Environment Variables
 
 See `.env.example` for placeholders. Keep real `.env` files and Firebase
 credentials out of git. `GOOGLE_OAUTH_CLIENT_ID`, Firebase credentials, and
 Cloudinary credentials are optional for tests and local API startup unless the
 corresponding integration is exercised.
+
+The platform liquidity account used for primary issuance is configured with
+`MARKETX_HOUSE_EMAIL`, `MARKETX_HOUSE_USERNAME`, and `MARKETX_HOUSE_CREDITS`.
+The credits value is allocated once when the liquidity wallet is first created.
 
 ## Current Real-time Strategy
 
