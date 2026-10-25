@@ -11,6 +11,12 @@ DATABASES = {
 
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 
+# Static-file serving is irrelevant to tests and whitenoise is an optional
+# production dependency, so do not require it when running the test client.
+MIDDLEWARE = [
+    middleware for middleware in MIDDLEWARE if "whitenoise" not in middleware.lower()
+]
+
 # Keep test throttles isolated from the configured Redis cache, and reset them
 # for every test process.
 CACHES = {

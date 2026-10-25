@@ -1,18 +1,26 @@
-from django.db.models import OuterRef, Q, Subquery, Sum
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Q, Sum
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from apps.markets.models import MarketPricePoint
+from apps.markets.models import MarketOutcome
 from .models import ActivityEvent, Order, Position, Trade
 from .serializers import (
     ActivityEventSerializer,
     OrderSerializer,
     PositionSerializer,
+    QuoteRequestSerializer,
     SubmitOrderSerializer,
     TradeSerializer,
 )
-from .services import cancel_order, get_order_book_depth, submit_limit_order
+from .services import (
+    cancel_order,
+    get_order_book_depth,
+    quote_order,
+    submit_limit_order,
+)
 
 
 class OrderViewSet(viewsets.ModelViewSet):
@@ -31,7 +39,8 @@ class OrderViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(outcome_id=outcome_id)
         if self.request.query_params.get("active") in {"true", "1"}:
             queryset = queryset.filter(
-                status__in=[Order.Status.OPEN, Order.Status.PARTIALLY_FILLED]
+                status__in=[Order.Status.OPEN, Order.Status.PARTIALLY_FILLED],
+                cancelled_at__isnull=True,
             )
         status_value = self.request.query_params.get("status")
         if status_value in Order.Status.values:
@@ -41,18 +50,30 @@ class OrderViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = SubmitOrderSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        order = submit_limit_order(
-            user=request.user,
-            outcome_id=serializer.validated_data["outcome"].id,
-            side=serializer.validated_data["side"],
-            limit_price=serializer.validated_data["limit_price"],
-            quantity=serializer.validated_data["quantity"],
-            client_order_id=serializer.validated_data["client_order_id"],
-        )
+        try:
+            order = submit_limit_order(
+                user=request.user,
+                outcome_id=serializer.validated_data["outcome"].id,
+                side=serializer.validated_data["side"],
+                limit_price=serializer.validated_data["limit_price"],
+                quantity=serializer.validated_data["quantity"],
+                client_order_id=serializer.validated_data["client_order_id"],
+            )
+        except DjangoValidationError as exc:
+            return Response(
+                {"detail": exc.messages},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, *args, **kwargs):
-        order = cancel_order(user=request.user, order_id=kwargs["pk"])
+        try:
+            order = cancel_order(user=request.user, order_id=kwargs["pk"])
+        except Order.DoesNotExist:
+            return Response(
+                {"detail": "Order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         return Response(OrderSerializer(order).data)
 
 
@@ -78,15 +99,10 @@ class PositionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        latest_price = (
-            MarketPricePoint.objects.filter(outcome=OuterRef("outcome"))
-            .order_by("-timestamp")
-            .values("price")[:1]
-        )
         queryset = (
             Position.objects.filter(user=self.request.user)
             .select_related("outcome", "outcome__market")
-            .annotate(latest_price=Subquery(latest_price))
+            .prefetch_related("outcome__market__outcomes")
             .order_by("outcome__market__title", "outcome__display_order")
         )
         outcome_id = self.request.query_params.get("outcome")
@@ -114,7 +130,37 @@ class OrderBookViewSet(viewsets.ViewSet):
             return Response({"detail": "limit must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
         if limit < 1:
             return Response({"detail": "limit must be positive."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(get_order_book_depth(outcome_id=pk, limit=limit))
+        try:
+            depth = get_order_book_depth(outcome_id=pk, limit=limit)
+        except MarketOutcome.DoesNotExist:
+            return Response(
+                {"detail": "Outcome not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(depth)
+
+
+class QuoteView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        serializer = QuoteRequestSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            quote = quote_order(
+                user=request.user,
+                outcome_id=data["outcome"].id,
+                side=data["side"],
+                quantity=data["quantity"],
+                limit_price=data["limit_price"],
+            )
+        except DjangoValidationError as exc:
+            return Response(
+                {"detail": exc.messages},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(quote)
 
 
 class ActivityEventViewSet(viewsets.ReadOnlyModelViewSet):

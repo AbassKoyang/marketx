@@ -14,7 +14,7 @@ def get_house_user():
     Return the system liquidity account, creating it on first use.
 
     The account is inactive (it can never log in) and holds the collateral
-    that backs shares minted by the matching engine.
+    that backs shares minted by the market maker.
     """
     user, created = User.objects.get_or_create(
         email=settings.MARKETX_HOUSE_EMAIL,

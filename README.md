@@ -32,23 +32,42 @@ celery -A config beat -l info
 ## Core Accounting
 
 All monetary-like values are integers. `CREDIT_SCALE = 10000`, so `10000`
-units equals one virtual payout credit. Limit prices are ticks from `1` to
+units equals one virtual payout credit. Prices are integer ticks from `1` to
 `9999`; a contract pays `10000` units if its outcome wins. Quantities are whole
 contracts.
 
-BUY orders reserve `limit_price * quantity` virtual-credit units in the wallet.
-Trades execute at the resting order's limit price. If a BUY executes below its
-limit, the excess reservation for that fill is released immediately. SELL
-orders reserve existing position quantity, so naked short selling is not
-supported.
+Every market has a single price vector calculated by an LMSR market maker:
 
-Markets do not need a pre-existing seller. When a BUY cannot be filled by a
-resting SELL, the platform liquidity account mints a complete set: one share of
-every active outcome. The buyer receives the requested outcome at their limit
-price and the liquidity account keeps the complementary shares. Each minted set
-reserves `CREDIT_SCALE` credits of collateral in the liquidity wallet, so every
-winning payout is fully funded. Existing liquidity inventory is sold before new
-sets are minted, and `Market.issuance_limit` caps sets per market.
+```text
+price_i = exp(q_i / b) / sum(exp(q_j / b))
+```
+
+`q_i` is `MarketOutcome.net_shares` (net shares the market maker has sold) and
+`b` is `Market.liquidity_b` (default `1000`, larger means deeper liquidity). The
+result is quantized to integer ticks that always sum to `CREDIT_SCALE`, so the
+displayed prices for all active outcomes sum to 100%. Prices move automatically
+with trading volume; there is no last-trade price per outcome.
+
+The platform liquidity account is the sole counterparty. Orders execute
+immediately against the market maker and never rest in an order book:
+
+- A BUY mints complete sets when the market maker does not already hold the
+  requested outcome, sells the requested shares, and keeps the complementary
+  shares. Each minted set reserves `CREDIT_SCALE` credits of collateral in the
+  liquidity wallet, so every winning payout is fully funded.
+- A SELL buys shares back from the user at the LMSR refund. No shares are minted
+  or burned; the market maker's `net_shares` for that outcome decrease.
+- Existing market-maker inventory is sold before new sets are minted, and
+  `Market.issuance_limit` caps sets per market.
+
+`limit_price` is a slippage cap, not a resting price: it is the maximum average
+price for a BUY and the minimum average price for a SELL. The largest quantity
+that respects the cap is filled; any unfilled remainder is cancelled
+immediately. Omit `limit_price` for a market order (BUY defaults to `9999`,
+SELL to `1`). BUY orders debit the exact LMSR notional (rounded up); SELL orders
+credit the exact refund (rounded down), which prevents rounding arbitrage.
+SELL orders can only sell shares the user owns, so naked short selling is not
+supported.
 
 On resolution, the reserved issuance collateral funds the winning payouts. On a
 void market it funds cost-basis refunds. Because complete sets pay exactly
@@ -60,23 +79,19 @@ Ledger rows are immutable audit records with unique idempotency keys. Critical
 trading operations use `transaction.atomic()` and row locks around orders,
 wallets, and positions.
 
-## Matching Rules
+## Market Maker Pricing
 
-PostgreSQL is the authoritative source of truth. Open orders are matched with
-price-time priority:
+`apps.trading.pricing` contains the pure pricing math: stable LMSR
+probabilities, integer quantization, `buy_cost`, `sell_refund`, and bounded
+searches for the largest fillable quantity. `apps.trading.services` applies the
+same math for execution, quotes, order-book depth, and settlement. Because both
+paths share the pricing module, an API quote matches the eventual execution
+exactly for the same state.
 
-- incoming buys match the lowest priced resting sells at or below the buy limit;
-- incoming sells match the highest priced resting buys at or above the sell
-  limit;
-- orders at the same price are matched by creation time and primary key;
-- a BUY that still has quantity left is filled by primary issuance, so the
-  first trade in a market can happen without any seller;
-- partial fills update remaining quantities and keep the unfilled order open;
-- cancellations release unfilled BUY reservations or SELL reserved quantity.
-
-`apps.trading.matching.order_book.OrderBook` provides a deterministic heap plus
-FIFO price-level implementation for tests and snapshots. It handles stale heap
-entries lazily; the database remains authoritative.
+The legacy `apps.trading.matching.order_book.OrderBook` remains as a
+deterministic heap/FIFO helper for snapshots and tests, but it is not used to
+execute trades. PostgreSQL is the authoritative source of truth for prices,
+positions, and cash.
 
 ## APIs
 
@@ -99,6 +114,7 @@ Trading and portfolio:
 - `POST /api/trading/orders/`
 - `GET /api/trading/orders/`
 - `DELETE /api/trading/orders/{id}/`
+- `GET /api/trading/quote/?outcome={id}&side=buy&quantity={n}`
 - `GET /api/trading/trades/?outcome={id}`
 - `GET /api/trading/positions/`
 - `GET /api/trading/positions/summary/`
@@ -126,9 +142,10 @@ Market administration:
 ## Chart History
 
 Chart points are generated only from committed trades. Each trade updates the
-one-minute bucket for its outcome with the latest traded price and interval
-volume. The history endpoint returns Unix timestamps, decimal prices, volume,
-and seconds until the market resolution deadline.
+one-minute bucket for every active outcome of its market with the resulting
+unified price vector and the trade's interval volume. The history endpoint
+returns Unix timestamps, decimal prices, volume, and seconds until the market
+resolution deadline.
 
 ## Operations
 
@@ -138,8 +155,11 @@ Run reconciliation before and after high-risk changes:
 python manage.py reconcile_marketx
 ```
 
-It reports wallet-ledger mismatches, order-fill mismatches, and reserved
-position discrepancies. It does not mutate data.
+It reports wallet-ledger mismatches, order-fill mismatches, reserved position
+discrepancies, and market-maker invariants: total position quantity per outcome
+must equal `Market.issued_quantity`, `net_shares` cannot exceed issued shares,
+and reserved house collateral must equal `issued_quantity * CREDIT_SCALE`. It
+does not mutate data.
 
 ## Tests
 
@@ -158,9 +178,11 @@ credentials out of git. `GOOGLE_OAUTH_CLIENT_ID`, Firebase credentials, and
 Cloudinary credentials are optional for tests and local API startup unless the
 corresponding integration is exercised.
 
-The platform liquidity account used for primary issuance is configured with
+The platform liquidity account used by the market maker is configured with
 `MARKETX_HOUSE_EMAIL`, `MARKETX_HOUSE_USERNAME`, and `MARKETX_HOUSE_CREDITS`.
 The credits value is allocated once when the liquidity wallet is first created.
+Each market also has `Market.liquidity_b` (default `1000`), which controls price
+depth; larger values make prices move more slowly for the same volume.
 
 ## Current Real-time Strategy
 

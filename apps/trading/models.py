@@ -79,7 +79,10 @@ class Order(models.Model):
 
     @property
     def is_open_for_matching(self):
-        return self.status in {self.Status.OPEN, self.Status.PARTIALLY_FILLED}
+        return (
+            self.status in {self.Status.OPEN, self.Status.PARTIALLY_FILLED}
+            and self.cancelled_at is None
+        )
 
 
 class Trade(models.Model):
@@ -111,6 +114,10 @@ class Trade(models.Model):
     )
     price = models.PositiveIntegerField()
     quantity = models.PositiveBigIntegerField()
+    # Exact LMSR cash amount in credit units. ``price`` is only the rounded
+    # average execution tick used for display; wallet and cost-basis flows use
+    # this integer so they never drift from the pricing curve.
+    notional = models.BigIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
@@ -123,6 +130,10 @@ class Trade(models.Model):
             models.CheckConstraint(
                 condition=Q(quantity__gt=0),
                 name="trade_positive_quantity",
+            ),
+            models.CheckConstraint(
+                condition=Q(notional__gte=0),
+                name="trade_nonnegative_notional",
             ),
             models.CheckConstraint(
                 condition=~Q(buyer=models.F("seller")),

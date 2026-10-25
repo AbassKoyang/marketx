@@ -91,6 +91,12 @@ class Market(models.Model):
     issuance_limit = models.PositiveBigIntegerField(default=10_000)
     issued_quantity = models.PositiveBigIntegerField(default=0)
 
+    # LMSR liquidity parameter. Larger values make the automated market maker
+    # deeper: a trade of a given size moves prices less. The market maker's
+    # worst-case subsidy is approximately liquidity_b * ln(outcome_count)
+    # credits, so it must stay within the liquidity account's funding.
+    liquidity_b = models.PositiveBigIntegerField(default=1_000)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -120,6 +126,10 @@ class Market(models.Model):
             models.CheckConstraint(
                 condition=Q(issued_quantity__lte=models.F("issuance_limit")),
                 name="market_issued_within_limit",
+            ),
+            models.CheckConstraint(
+                condition=Q(liquidity_b__gte=1),
+                name="market_positive_liquidity_b",
             ),
         ]
 
@@ -178,6 +188,10 @@ class MarketOutcome(models.Model):
     image_url = models.URLField(blank=True)
     display_order = models.PositiveSmallIntegerField(default=0)
     is_active = models.BooleanField(default=True)
+
+    # Net shares sold by the LMSR market maker for this outcome. The market
+    # maker holds ``issued_quantity - net_shares`` shares of the outcome.
+    net_shares = models.PositiveBigIntegerField(default=0)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

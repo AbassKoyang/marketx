@@ -6,6 +6,7 @@ from .models import Market, MarketCategory, MarketOutcome, MarketPricePoint, Mar
 class MarketOutcomeInline(admin.TabularInline):
     model = MarketOutcome
     extra = 0
+    readonly_fields = ("net_shares",)
 
 
 @admin.register(Market)
@@ -19,6 +20,7 @@ class MarketAdmin(admin.ModelAdmin):
         "is_featured",
         "issued_quantity",
         "issuance_limit",
+        "liquidity_b",
     )
     list_filter = ("status", "market_type", "category", "is_featured")
     search_fields = ("title", "question")

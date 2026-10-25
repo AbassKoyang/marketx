@@ -12,7 +12,16 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(Trade)
 class TradeAdmin(admin.ModelAdmin):
-    list_display = ("id", "outcome", "buyer", "seller", "price", "quantity", "created_at")
+    list_display = (
+        "id",
+        "outcome",
+        "buyer",
+        "seller",
+        "price",
+        "quantity",
+        "notional",
+        "created_at",
+    )
     search_fields = ("buyer__email", "seller__email", "execution_id")
 
 

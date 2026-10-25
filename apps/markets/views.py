@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from django.db.models import Max, Min, OuterRef, Prefetch, Subquery, Sum
+from django.db.models import Max, Min, Prefetch, Sum
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -16,6 +16,7 @@ from .serializers import (
     MarketOutcomeSerializer,
     MarketPricePointSerializer,
     MarketSerializer,
+    price_map_for_market,
 )
 
 
@@ -52,14 +53,7 @@ class MarketViewSet(viewsets.ModelViewSet):
     lookup_field = "slug"
 
     def get_queryset(self):
-        latest_price = (
-            MarketPricePoint.objects.filter(outcome=OuterRef("pk"))
-            .order_by("-timestamp")
-            .values("price")[:1]
-        )
-        outcomes = MarketOutcome.objects.annotate(
-            latest_price_value=Subquery(latest_price)
-        ).order_by("display_order", "id")
+        outcomes = MarketOutcome.objects.order_by("display_order", "id")
         queryset = (
             Market.objects.select_related("category", "created_by", "resolution")
             .prefetch_related(Prefetch("outcomes", queryset=outcomes))
@@ -93,11 +87,21 @@ class MarketViewSet(viewsets.ModelViewSet):
         outcome_ids = market.outcomes.values_list("id", flat=True)
         trades = Trade.objects.filter(outcome_id__in=outcome_ids)
         latest = trades.order_by("-created_at").first()
+        active_outcomes = [outcome for outcome in market.outcomes.all() if outcome.is_active]
+        price_map = price_map_for_market(market, {})
+        prices = {
+            outcome.slug: price_map.get(outcome.id, 0) / CREDIT_SCALE
+            for outcome in active_outcomes
+        }
         depth = {}
-        for outcome in market.outcomes.all():
+        for outcome in active_outcomes:
             depth[outcome.slug] = get_order_book_depth(outcome_id=outcome.id, limit=5)
         return Response({
+            # ``latest_price`` is kept for older clients. New clients should use
+            # the unified ``prices`` vector, which always sums to 1.
             "latest_price": latest.price / CREDIT_SCALE if latest else None,
+            "prices": prices,
+            "liquidity_b": market.liquidity_b,
             "total_volume": trades.aggregate(total=Sum("quantity"))["total"] or 0,
             "trade_count": trades.count(),
             "first_trade_at": trades.aggregate(value=Min("created_at"))["value"],
@@ -170,7 +174,11 @@ class MarketOutcomeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffOrReadOnly]
 
     def get_queryset(self):
-        queryset = MarketOutcome.objects.select_related("market").filter(is_active=True)
+        queryset = (
+            MarketOutcome.objects.select_related("market")
+            .prefetch_related("market__outcomes")
+            .filter(is_active=True)
+        )
         if not (self.request.user and self.request.user.is_staff):
             queryset = queryset.exclude(market__status=Market.Status.DRAFT)
         return queryset

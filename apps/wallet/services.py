@@ -337,6 +337,30 @@ def consume_reserved_credits(
 
 
 @transaction.atomic
+def debit_available_credits(
+    *,
+    user_id,
+    amount,
+    idempotency_key,
+    reference_type="trade",
+    reference_id="",
+    description="Credits spent",
+):
+    """Remove available credits immediately, for trades that settle at once."""
+    _validate_amount(amount)
+    return _mutate_wallet(
+        user_id=user_id,
+        entry_type="available_debit",
+        available_delta=-amount,
+        reserved_delta=0,
+        idempotency_key=idempotency_key,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        description=description,
+    )
+
+
+@transaction.atomic
 def credit_available_credits(
     *,
     user_id,

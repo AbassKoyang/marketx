@@ -1,9 +1,11 @@
 import uuid
 from datetime import timedelta
 
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import ExpressionWrapper, F, Q, Sum, BigIntegerField
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from apps.markets.models import Market, MarketOutcome, MarketPricePoint, MarketResolution
@@ -11,12 +13,21 @@ from apps.wallet.models import Wallet
 from apps.wallet.services import (
     consume_reserved_credits,
     credit_available_credits,
+    debit_available_credits,
     release_reserved_credits,
     reserve_credits,
 )
 from .constants import CREDIT_SCALE, MAX_PRICE, MIN_PRICE
 from .house import get_house_user
 from .models import ActivityEvent, Order, Position, Settlement, Trade
+from .pricing import (
+    average_tick,
+    buy_cost,
+    lmsr_prices,
+    max_buy_quantity,
+    max_sell_quantity,
+    sell_refund,
+)
 
 
 class TradingError(ValidationError):
@@ -31,6 +42,10 @@ class InsufficientPosition(TradingError):
     pass
 
 
+class InsufficientLiquidity(TradingError):
+    pass
+
+
 def _validate_order_input(*, price, quantity, client_order_id):
     if not client_order_id:
         raise ValidationError("A client_order_id is required.")
@@ -42,21 +57,78 @@ def _validate_order_input(*, price, quantity, client_order_id):
         raise ValidationError("Quantity must be a positive integer.")
 
 
-def _set_order_fill_state(order):
-    if order.filled_quantity >= order.original_quantity:
-        order.status = Order.Status.FILLED
-    elif order.filled_quantity > 0:
-        order.status = Order.Status.PARTIALLY_FILLED
-    else:
-        order.status = Order.Status.OPEN
-
-
 def _open_status_filter():
-    return Q(status=Order.Status.OPEN) | Q(status=Order.Status.PARTIALLY_FILLED)
+    return (
+        Q(status=Order.Status.OPEN) | Q(status=Order.Status.PARTIALLY_FILLED)
+    ) & Q(cancelled_at__isnull=True)
+
+
+def _active_outcomes(market):
+    return list(
+        MarketOutcome.objects.filter(market=market, is_active=True).order_by(
+            "display_order", "id"
+        )
+    )
+
+
+def _outcome_index(outcomes, outcome_id):
+    for index, outcome in enumerate(outcomes):
+        if outcome.pk == outcome_id:
+            return index
+    raise ValidationError("Outcome is not active in this market.")
+
+
+def _net_shares(outcomes):
+    return [outcome.net_shares for outcome in outcomes]
+
+
+def _readonly_house():
+    house = (
+        get_user_model()
+        .objects.filter(email=settings.MARKETX_HOUSE_EMAIL)
+        .first()
+    )
+    wallet = Wallet.objects.filter(user=house).first() if house else None
+    # Before the first trade the liquidity account has not been created yet.
+    # Quotes and depth previews should still reflect the configured funding.
+    available = (
+        wallet.available_balance
+        if wallet is not None
+        else settings.MARKETX_HOUSE_CREDITS
+    )
+    return house, wallet, available
+
+
+def _house_inventory(house, outcomes):
+    positions = {
+        position.outcome_id: position
+        for position in Position.objects.filter(user=house, outcome__in=outcomes)
+    }
+    return positions
+
+
+def _inventory_available(position):
+    if position is None:
+        return 0
+    return max(0, position.quantity - position.reserved_quantity)
+
+
+def _max_amm_buy_quantity(*, market, house_available_credits, inventory_available):
+    remaining_sets = max(0, market.issuance_limit - market.issued_quantity)
+    affordable_sets = house_available_credits // CREDIT_SCALE
+    return inventory_available + min(remaining_sets, affordable_sets)
 
 
 @transaction.atomic
 def submit_limit_order(*, user, outcome_id, side, limit_price, quantity, client_order_id):
+    """
+    Execute an order immediately against the LMSR market maker.
+
+    ``limit_price`` is a slippage cap: the maximum average price for a BUY and
+    the minimum average price for a SELL.  The largest quantity that respects
+    the cap is filled.  Any unfilled remainder is cancelled immediately; the
+    order never rests in an order book.
+    """
     _validate_order_input(
         price=limit_price,
         quantity=quantity,
@@ -77,36 +149,68 @@ def submit_limit_order(*, user, outcome_id, side, limit_price, quantity, client_
             raise ValidationError("client_order_id was already used for a different order.")
         return existing
 
-    outcome = (
-        MarketOutcome.objects.select_related("market")
-        .select_for_update()
-        .get(pk=outcome_id)
-    )
+    outcome = MarketOutcome.objects.select_related("market").get(pk=outcome_id)
+    market = Market.objects.select_for_update().get(pk=outcome.market_id)
     now = timezone.now()
-    if outcome.market.status != Market.Status.OPEN:
+    if market.status != Market.Status.OPEN:
         raise MarketNotOpen("Orders can only be placed on open markets.")
-    if outcome.market.opens_at > now or outcome.market.closes_at <= now:
+    if market.opens_at > now or market.closes_at <= now:
         raise MarketNotOpen("Market is not inside its trading window.")
+
+    outcomes = _active_outcomes(market)
+    if len(outcomes) < 2:
+        raise TradingError("A market needs at least two active outcomes to trade.")
+    index = _outcome_index(outcomes, outcome_id)
+    outcome = outcomes[index]
     if not outcome.is_active:
         raise ValidationError("Outcome is not active.")
 
+    net_shares = _net_shares(outcomes)
+    house = get_house_user()
+    house_wallet = Wallet.objects.select_for_update().get(user=house)
+
     if side == Order.Side.BUY:
-        reserve_credits(
-            user_id=user.id,
-            amount=limit_price * quantity,
-            idempotency_key=f"order-reserve:{user.id}:{client_order_id}",
-            reference_type="order",
-            reference_id=client_order_id,
+        user_wallet = Wallet.objects.select_for_update().get(user=user)
+        house_positions = _house_inventory(house, outcomes)
+        inventory_available = _inventory_available(house_positions.get(outcome.id))
+        max_quantity = min(
+            quantity,
+            _max_amm_buy_quantity(
+                market=market,
+                house_available_credits=house_wallet.available_balance,
+                inventory_available=inventory_available,
+            ),
         )
+        fill_quantity = max_buy_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=max_quantity,
+            max_cost=user_wallet.available_balance,
+        )
+        if fill_quantity <= 0:
+            raise TradingError("No quantity can fill at this limit.")
+        notional = buy_cost(net_shares, index, fill_quantity, market.liquidity_b)
     else:
-        position, _ = Position.objects.select_for_update().get_or_create(
-            user=user,
-            outcome=outcome,
+        position = (
+            Position.objects.select_for_update()
+            .filter(user=user, outcome=outcome)
+            .first()
         )
-        if position.quantity - position.reserved_quantity < quantity:
-            raise InsufficientPosition("Not enough unreserved contracts to sell.")
-        position.reserved_quantity += quantity
-        position.save(update_fields=["reserved_quantity", "updated_at"])
+        available_shares = _inventory_available(position)
+        max_quantity = min(quantity, available_shares, net_shares[index])
+        fill_quantity = max_sell_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=max_quantity,
+            max_refund=house_wallet.available_balance,
+        )
+        if fill_quantity <= 0:
+            raise TradingError("No quantity can fill at this limit.")
+        notional = sell_refund(net_shares, index, fill_quantity, market.liquidity_b)
 
     order = Order.objects.create(
         user=user,
@@ -116,14 +220,359 @@ def submit_limit_order(*, user, outcome_id, side, limit_price, quantity, client_
         original_quantity=quantity,
         client_order_id=client_order_id,
     )
-    _record_private_event(
-        user_id=user.id,
-        event_type="order_placed",
-        outcome_id=outcome.id,
-        payload={"order_id": order.id, "side": side, "quantity": quantity, "limit_price": limit_price},
-    )
-    _match_order(order.id)
+
+    if side == Order.Side.BUY:
+        _execute_buy(
+            order=order,
+            market=market,
+            outcomes=outcomes,
+            outcome=outcome,
+            index=index,
+            fill_quantity=fill_quantity,
+            notional=notional,
+            house=house,
+            house_wallet=house_wallet,
+        )
+    else:
+        _execute_sell(
+            order=order,
+            market=market,
+            outcomes=outcomes,
+            outcome=outcome,
+            index=index,
+            fill_quantity=fill_quantity,
+            notional=notional,
+            house=house,
+            house_wallet=house_wallet,
+        )
+
+    _finalize_order(order, fill_quantity=fill_quantity, requested_quantity=quantity)
     return Order.objects.get(pk=order.pk)
+
+
+def _finalize_order(order, *, fill_quantity, requested_quantity):
+    order.filled_quantity = fill_quantity
+    if fill_quantity >= requested_quantity:
+        order.status = Order.Status.FILLED
+        order.cancelled_at = None
+    else:
+        # The order was marketable for only part of its size.  The rest is
+        # cancelled immediately rather than left resting.
+        order.status = Order.Status.PARTIALLY_FILLED
+        order.cancelled_at = timezone.now()
+    order.save(
+        update_fields=["filled_quantity", "status", "cancelled_at", "updated_at"]
+    )
+
+
+def _execute_buy(
+    *,
+    order,
+    market,
+    outcomes,
+    outcome,
+    index,
+    fill_quantity,
+    notional,
+    house,
+    house_wallet,
+):
+    house_positions = {
+        position.outcome_id: position
+        for position in Position.objects.select_for_update().filter(
+            user=house, outcome__in=outcomes
+        )
+    }
+    inventory_available = _inventory_available(house_positions.get(outcome.id))
+    mint_quantity = max(0, fill_quantity - inventory_available)
+
+    remaining_sets = max(0, market.issuance_limit - market.issued_quantity)
+    affordable_sets = house_wallet.available_balance // CREDIT_SCALE
+    if mint_quantity > remaining_sets or mint_quantity > affordable_sets:
+        raise InsufficientLiquidity("The market maker cannot mint enough shares.")
+    if fill_quantity <= 0:
+        raise InsufficientLiquidity("The market maker has no shares available.")
+
+    if mint_quantity:
+        reserve_credits(
+            user_id=house.id,
+            amount=CREDIT_SCALE * mint_quantity,
+            idempotency_key=f"issuance-collateral:{market.id}:{uuid.uuid4().hex}",
+            reference_type="market",
+            reference_id=market.id,
+        )
+        sold_basis = notional * mint_quantity // fill_quantity
+        _mint_house_positions(
+            house=house,
+            house_positions=house_positions,
+            outcomes=outcomes,
+            sold_outcome=outcome,
+            mint_quantity=mint_quantity,
+            sold_basis=sold_basis,
+        )
+        market.issued_quantity += mint_quantity
+        market.save(update_fields=["issued_quantity", "updated_at"])
+
+    price = average_tick(notional, fill_quantity, side="buy")
+    house_order = Order.objects.create(
+        user=house,
+        outcome=outcome,
+        side=Order.Side.SELL,
+        limit_price=price,
+        original_quantity=fill_quantity,
+        filled_quantity=fill_quantity,
+        status=Order.Status.FILLED,
+        client_order_id=f"amm:{uuid.uuid4().hex}",
+    )
+    trade = Trade.objects.create(
+        outcome=outcome,
+        buy_order=order,
+        sell_order=house_order,
+        buyer_id=order.user_id,
+        seller=house,
+        price=price,
+        quantity=fill_quantity,
+        notional=notional,
+    )
+
+    debit_available_credits(
+        user_id=order.user_id,
+        amount=notional,
+        idempotency_key=f"trade-spend:{trade.id}:buyer",
+        reference_type="trade",
+        reference_id=trade.id,
+        description="Credits spent buying outcome shares",
+    )
+    credit_available_credits(
+        user_id=house.id,
+        amount=notional,
+        idempotency_key=f"trade-proceeds:{trade.id}:seller",
+        reference_type="trade",
+        reference_id=trade.id,
+        description="Market maker share sale proceeds",
+    )
+
+    buyer_position, _ = Position.objects.select_for_update().get_or_create(
+        user=order.user,
+        outcome=outcome,
+    )
+    buyer_position.quantity += fill_quantity
+    buyer_position.cost_basis += notional
+    buyer_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
+
+    sold_position = house_positions.get(outcome.id)
+    if sold_position is None or sold_position.quantity < fill_quantity:
+        raise InsufficientLiquidity("The market maker inventory is inconsistent.")
+    released_basis = sold_position.cost_basis * fill_quantity // sold_position.quantity
+    sold_position.quantity -= fill_quantity
+    sold_position.cost_basis -= released_basis
+    sold_position.realized_pnl += notional - released_basis
+    sold_position.save(
+        update_fields=["quantity", "cost_basis", "realized_pnl", "updated_at"]
+    )
+
+    outcome.net_shares += fill_quantity
+    outcome.save(update_fields=["net_shares", "updated_at"])
+
+    _record_price_vector(market=market, outcomes=outcomes, trade=trade)
+    _record_trade_events(
+        trade=trade,
+        market=market,
+        outcomes=outcomes,
+        user_order=order,
+        user_id=order.user_id,
+        user_is_buyer=True,
+    )
+
+
+def _execute_sell(
+    *,
+    order,
+    market,
+    outcomes,
+    outcome,
+    index,
+    fill_quantity,
+    notional,
+    house,
+    house_wallet,
+):
+    seller_position = Position.objects.select_for_update().get(
+        user=order.user,
+        outcome=outcome,
+    )
+    if seller_position.quantity - seller_position.reserved_quantity < fill_quantity:
+        raise InsufficientPosition("Not enough unreserved contracts to sell.")
+    if outcome.net_shares < fill_quantity:
+        raise InsufficientLiquidity("The market maker cannot buy back that many shares.")
+
+    house_position, _ = Position.objects.select_for_update().get_or_create(
+        user=house,
+        outcome=outcome,
+    )
+
+    price = average_tick(notional, fill_quantity, side="sell")
+    house_order = Order.objects.create(
+        user=house,
+        outcome=outcome,
+        side=Order.Side.BUY,
+        limit_price=price,
+        original_quantity=fill_quantity,
+        filled_quantity=fill_quantity,
+        status=Order.Status.FILLED,
+        client_order_id=f"amm:{uuid.uuid4().hex}",
+    )
+    trade = Trade.objects.create(
+        outcome=outcome,
+        buy_order=house_order,
+        sell_order=order,
+        buyer=house,
+        seller_id=order.user_id,
+        price=price,
+        quantity=fill_quantity,
+        notional=notional,
+    )
+
+    debit_available_credits(
+        user_id=house.id,
+        amount=notional,
+        idempotency_key=f"trade-spend:{trade.id}:buyer",
+        reference_type="trade",
+        reference_id=trade.id,
+        description="Market maker share buyback",
+    )
+    credit_available_credits(
+        user_id=order.user_id,
+        amount=notional,
+        idempotency_key=f"trade-proceeds:{trade.id}:seller",
+        reference_type="trade",
+        reference_id=trade.id,
+        description="Proceeds from selling outcome shares",
+    )
+
+    released_basis = (
+        seller_position.cost_basis * fill_quantity // seller_position.quantity
+    )
+    seller_position.quantity -= fill_quantity
+    seller_position.cost_basis -= released_basis
+    seller_position.realized_pnl += notional - released_basis
+    seller_position.save(
+        update_fields=["quantity", "cost_basis", "realized_pnl", "updated_at"]
+    )
+
+    house_position.quantity += fill_quantity
+    house_position.cost_basis += notional
+    house_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
+
+    outcome.net_shares -= fill_quantity
+    outcome.save(update_fields=["net_shares", "updated_at"])
+
+    _record_price_vector(market=market, outcomes=outcomes, trade=trade)
+    _record_trade_events(
+        trade=trade,
+        market=market,
+        outcomes=outcomes,
+        user_order=order,
+        user_id=order.user_id,
+        user_is_buyer=False,
+    )
+
+
+def _mint_house_positions(
+    *,
+    house,
+    house_positions,
+    outcomes,
+    sold_outcome,
+    mint_quantity,
+    sold_basis,
+):
+    """Increase the house inventory by one share of every outcome per set."""
+    complement_basis = CREDIT_SCALE * mint_quantity - sold_basis
+    complements = [item for item in outcomes if item.pk != sold_outcome.pk]
+    if not complements:
+        raise ValidationError("A complete set needs at least two outcomes.")
+    share, remainder = divmod(complement_basis, len(complements))
+
+    def position_for(item):
+        position = house_positions.get(item.id)
+        if position is None:
+            position = Position.objects.create(user=house, outcome=item)
+            house_positions[item.id] = position
+        return position
+
+    for index, item in enumerate(complements):
+        position = position_for(item)
+        position.quantity += mint_quantity
+        position.cost_basis += share + (1 if index < remainder else 0)
+        position.save(update_fields=["quantity", "cost_basis", "updated_at"])
+
+    sold_position = position_for(sold_outcome)
+    sold_position.quantity += mint_quantity
+    sold_position.cost_basis += sold_basis
+    sold_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
+
+
+def _record_price_vector(*, market, outcomes, trade):
+    """Persist the full post-trade price vector, not just the traded outcome."""
+    ticks = lmsr_prices(_net_shares(outcomes), market.liquidity_b)
+    bucket = trade.created_at.replace(second=0, microsecond=0)
+    resolution_seconds = max(
+        0,
+        int((market.resolution_deadline - trade.created_at).total_seconds()),
+    )
+    for outcome, tick in zip(outcomes, ticks):
+        defaults = {
+            "price": tick,
+            "resolution_seconds": resolution_seconds,
+            "source_trade_id": trade.id,
+        }
+        if outcome.pk == trade.outcome_id:
+            defaults["volume"] = (
+                Trade.objects.filter(
+                    outcome=outcome,
+                    created_at__gte=bucket,
+                    created_at__lt=bucket + timedelta(minutes=1),
+                ).aggregate(total=Sum("quantity"))["total"]
+                or 0
+            )
+        MarketPricePoint.objects.update_or_create(
+            outcome=outcome,
+            timestamp=bucket,
+            defaults=defaults,
+        )
+
+
+def _record_trade_events(*, trade, market, outcomes, user_order, user_id, user_is_buyer):
+    ticks = lmsr_prices(_net_shares(outcomes), market.liquidity_b)
+    price_vector = {
+        str(outcome.id): tick for outcome, tick in zip(outcomes, ticks)
+    }
+    _record_public_event(
+        event_type="trade_executed",
+        outcome_id=trade.outcome_id,
+        payload={
+            "trade_id": trade.id,
+            "price": trade.price,
+            "quantity": trade.quantity,
+            "notional": trade.notional,
+            "market_id": market.id,
+            "prices": price_vector,
+        },
+    )
+    _record_private_event(
+        user_id=user_id,
+        event_type="order_filled",
+        outcome_id=trade.outcome_id,
+        payload={
+            "trade_id": trade.id,
+            "order_id": user_order.id,
+            "side": user_order.side,
+            "quantity": trade.quantity,
+            "price": trade.price,
+            "notional": trade.notional,
+        },
+    )
 
 
 @transaction.atomic
@@ -189,351 +638,147 @@ def close_market(*, market_id):
     return market
 
 
-def _candidate_order(incoming):
-    opposite = Order.Side.SELL if incoming.side == Order.Side.BUY else Order.Side.BUY
-    crossing = (
-        Q(limit_price__lte=incoming.limit_price)
-        if incoming.side == Order.Side.BUY
-        else Q(limit_price__gte=incoming.limit_price)
-    )
-    ordering = ["limit_price", "created_at", "id"]
-    if incoming.side == Order.Side.SELL:
-        ordering = ["-limit_price", "created_at", "id"]
-    return (
-        Order.objects.select_for_update()
-        .filter(outcome=incoming.outcome, side=opposite)
-        .filter(_open_status_filter())
-        .filter(crossing)
-        .exclude(user=incoming.user)
-        .order_by(*ordering)
-        .first()
-    )
-
-
-def _apply_fill(order, quantity):
-    order.filled_quantity = F("filled_quantity") + quantity
-    order.save(update_fields=["filled_quantity", "updated_at"])
-    order.refresh_from_db()
-    _set_order_fill_state(order)
-    order.save(update_fields=["status", "updated_at"])
-
-
-def _match_order(order_id):
-    incoming = (
-        Order.objects.select_for_update()
-        .select_related("outcome")
-        .get(pk=order_id)
-    )
-
-    while incoming.remaining_quantity > 0 and incoming.is_open_for_matching:
-        resting = _candidate_order(incoming)
-        if resting is None:
-            break
-
-        quantity = min(incoming.remaining_quantity, resting.remaining_quantity)
-        price = resting.limit_price
-        buy_order = incoming if incoming.side == Order.Side.BUY else resting
-        sell_order = resting if incoming.side == Order.Side.BUY else incoming
-
-        trade = Trade.objects.create(
-            outcome=incoming.outcome,
-            buy_order=buy_order,
-            sell_order=sell_order,
-            buyer=buy_order.user,
-            seller=sell_order.user,
-            price=price,
-            quantity=quantity,
-        )
-        _record_public_event(
-            event_type="trade_executed",
-            outcome_id=trade.outcome_id,
-            payload={
-                "trade_id": trade.id,
-                "price": trade.price,
-                "quantity": trade.quantity,
-            },
-        )
-        _record_private_event(
-            user_id=trade.buyer_id,
-            event_type="order_filled",
-            outcome_id=trade.outcome_id,
-            payload={"trade_id": trade.id, "order_id": buy_order.id, "quantity": quantity, "price": price},
-        )
-        _record_private_event(
-            user_id=trade.seller_id,
-            event_type="order_filled",
-            outcome_id=trade.outcome_id,
-            payload={"trade_id": trade.id, "order_id": sell_order.id, "quantity": quantity, "price": price},
-        )
-        _apply_trade(trade)
-        _apply_fill(incoming, quantity)
-        _apply_fill(resting, quantity)
-
-    # Primary issuance: if no user is selling, the platform mints a complete
-    # set and sells the requested outcome to the buyer. This is what makes the
-    # first trade possible; the house keeps the complementary shares.
-    if (
-        incoming.side == Order.Side.BUY
-        and incoming.is_open_for_matching
-        and incoming.remaining_quantity > 0
-    ):
-        _issue_to_buyer(incoming)
-
-
-def _issue_to_buyer(incoming):
+def quote_order(*, user, outcome_id, side, quantity, limit_price):
     """
-    Sell shares to a buyer by minting complete sets.
+    Preview an AMM order without mutating any state.
 
-    Each minted set adds one share of every active outcome. The buyer pays for
-    the outcome they want; the platform keeps the others. CREDIT_SCALE credits
-    are reserved per set, so settlement payouts are always fully collateralized.
-    Existing house inventory is sold before minting new sets.
-
-    Returns the number of shares issued.
+    Returns the fillable quantity, exact cash amount, average price, and the
+    price vector that would result from the fill.
     """
-    market = Market.objects.select_for_update().get(
-        pk=incoming.outcome.market_id
+    if side not in Order.Side.values:
+        raise ValidationError("Side must be buy or sell.")
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+        raise ValidationError("Quantity must be a positive integer.")
+    _validate_order_input(
+        price=limit_price,
+        quantity=quantity,
+        client_order_id="quote",
     )
+
+    outcome = MarketOutcome.objects.select_related("market").get(pk=outcome_id)
+    market = outcome.market
     if market.status != Market.Status.OPEN:
-        return 0
-
-    now = timezone.now()
-    if market.opens_at > now or market.closes_at <= now:
-        return 0
-
-    # Outcome rows are immutable while a market is open, and the market lock
-    # above already serializes issuance for this market. Do not lock every
-    # outcome row here: doing so can deadlock against order submission, which
-    # locks a single outcome before taking the market lock.
-    outcomes = list(
-        MarketOutcome.objects.filter(market=market, is_active=True).order_by(
-            "display_order", "id"
-        )
-    )
-    # A complete set needs at least two outcomes to have a well-defined payout.
+        raise MarketNotOpen("Quotes are only available for open markets.")
+    outcomes = _active_outcomes(market)
     if len(outcomes) < 2:
-        return 0
+        raise TradingError("A market needs at least two active outcomes to trade.")
+    index = _outcome_index(outcomes, outcome_id)
+    outcome = outcomes[index]
+    net_shares = _net_shares(outcomes)
+    current_ticks = lmsr_prices(net_shares, market.liquidity_b)
+    house, house_wallet, house_available = _readonly_house()
 
-    outcome = next((item for item in outcomes if item.pk == incoming.outcome_id), None)
-    if outcome is None:
-        return 0
-
-    house = get_house_user()
-    house_wallet = Wallet.objects.select_for_update().get(user=house)
-    house_positions = {
-        position.outcome_id: position
-        for position in Position.objects.select_for_update().filter(
-            user=house, outcome__in=outcomes
-        )
-    }
-
-    inventory = house_positions.get(outcome.id)
-    inventory_available = (
-        max(0, inventory.quantity - inventory.reserved_quantity)
-        if inventory
-        else 0
-    )
-
-    remaining_sets = max(0, market.issuance_limit - market.issued_quantity)
-    affordable_sets = house_wallet.available_balance // CREDIT_SCALE
-    mint_quantity = min(
-        max(0, incoming.remaining_quantity - inventory_available),
-        remaining_sets,
-        affordable_sets,
-    )
-    fill_quantity = min(
-        incoming.remaining_quantity,
-        inventory_available + mint_quantity,
-    )
-    if fill_quantity <= 0:
-        return 0
-
-    price = incoming.limit_price
-    if mint_quantity:
-        reserve_credits(
-            user_id=house.id,
-            amount=CREDIT_SCALE * mint_quantity,
-            idempotency_key=f"issuance-collateral:{incoming.id}:{uuid.uuid4().hex}",
-            reference_type="market",
-            reference_id=market.id,
-        )
-        _mint_house_positions(
-            house=house,
-            house_positions=house_positions,
-            outcomes=outcomes,
-            sold_outcome=outcome,
-            mint_quantity=mint_quantity,
-            price=price,
-        )
-        market.issued_quantity += mint_quantity
-        market.save(update_fields=["issued_quantity", "updated_at"])
-
-    sold_position = house_positions[outcome.id]
-    sold_position.reserved_quantity += fill_quantity
-    sold_position.save(update_fields=["reserved_quantity", "updated_at"])
-
-    house_order = Order.objects.create(
-        user=house,
-        outcome=outcome,
-        side=Order.Side.SELL,
-        limit_price=price,
-        original_quantity=fill_quantity,
-        client_order_id=f"issuance:{uuid.uuid4().hex}",
-    )
-    trade = Trade.objects.create(
-        outcome=outcome,
-        buy_order=incoming,
-        sell_order=house_order,
-        buyer_id=incoming.user_id,
-        seller=house,
-        price=price,
-        quantity=fill_quantity,
-    )
-    _record_public_event(
-        event_type="trade_executed",
-        outcome_id=trade.outcome_id,
-        payload={
-            "trade_id": trade.id,
-            "price": trade.price,
-            "quantity": trade.quantity,
-            "issuance": mint_quantity > 0,
-        },
-    )
-    _record_private_event(
-        user_id=incoming.user_id,
-        event_type="order_filled",
-        outcome_id=trade.outcome_id,
-        payload={
-            "trade_id": trade.id,
-            "order_id": incoming.id,
-            "quantity": fill_quantity,
-            "price": price,
-        },
-    )
-    _apply_trade(trade)
-    _apply_fill(house_order, fill_quantity)
-    _apply_fill(incoming, fill_quantity)
-    return fill_quantity
-
-
-def _mint_house_positions(
-    *, house, house_positions, outcomes, sold_outcome, mint_quantity, price
-):
-    """Increase the house inventory by one share of every outcome per set."""
-    sold_basis = price * mint_quantity
-    complement_basis = CREDIT_SCALE * mint_quantity - sold_basis
-    complements = [item for item in outcomes if item.pk != sold_outcome.pk]
-    share, remainder = divmod(complement_basis, len(complements))
-
-    def position_for(item):
-        position = house_positions.get(item.id)
-        if position is None:
-            position = Position.objects.create(user=house, outcome=item)
-            house_positions[item.id] = position
-        return position
-
-    for index, item in enumerate(complements):
-        position = position_for(item)
-        position.quantity += mint_quantity
-        position.cost_basis += share + (1 if index < remainder else 0)
-        position.save(update_fields=["quantity", "cost_basis", "updated_at"])
-
-    sold_position = position_for(sold_outcome)
-    sold_position.quantity += mint_quantity
-    sold_position.cost_basis += sold_basis
-    sold_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
-
-
-def _apply_trade(trade):
-    buyer_position, _ = Position.objects.select_for_update().get_or_create(
-        user=trade.buyer,
-        outcome=trade.outcome,
-    )
-    seller_position = Position.objects.select_for_update().get(
-        user=trade.seller,
-        outcome=trade.outcome,
-    )
-
-    buyer_cost = trade.price * trade.quantity
-    buyer_limit = trade.buy_order.limit_price * trade.quantity
-    credit_spent_key = f"trade-spend:{trade.id}:buyer"
-    consume_reserved_credits(
-        user_id=trade.buyer_id,
-        amount=buyer_cost,
-        idempotency_key=credit_spent_key,
-        reference_type="trade",
-        reference_id=trade.id,
-    )
-    excess = buyer_limit - buyer_cost
-    if excess > 0:
-        release_reserved_credits(
-            user_id=trade.buyer_id,
-            amount=excess,
-            idempotency_key=f"trade-price-improvement:{trade.id}:buyer",
-            reference_type="trade",
-            reference_id=trade.id,
-        )
-
-    credit_available_credits(
-        user_id=trade.seller_id,
-        amount=buyer_cost,
-        idempotency_key=f"trade-proceeds:{trade.id}:seller",
-        reference_type="trade",
-        reference_id=trade.id,
-        description="Trade proceeds credited to seller",
-    )
-
-    released_cost_basis = 0
-    if seller_position.quantity:
-        released_cost_basis = (
-            seller_position.cost_basis * trade.quantity // seller_position.quantity
-        )
-
-    buyer_position.quantity += trade.quantity
-    buyer_position.cost_basis += buyer_cost
-    buyer_position.save(update_fields=["quantity", "cost_basis", "updated_at"])
-
-    seller_position.quantity -= trade.quantity
-    seller_position.reserved_quantity -= trade.quantity
-    seller_position.cost_basis -= released_cost_basis
-    seller_position.realized_pnl += buyer_cost - released_cost_basis
-    seller_position.save(
-        update_fields=[
-            "quantity",
-            "reserved_quantity",
-            "cost_basis",
-            "realized_pnl",
-            "updated_at",
-        ]
-    )
-
-    _record_trade_price_point(trade)
-
-
-def _record_trade_price_point(trade):
-    MarketPricePoint.objects.update_or_create(
-        outcome=trade.outcome,
-        timestamp=trade.created_at.replace(second=0, microsecond=0),
-        defaults={
-            "price": trade.price,
-            "volume": Trade.objects.filter(
-                outcome=trade.outcome,
-                created_at__gte=trade.created_at.replace(second=0, microsecond=0),
-                created_at__lt=trade.created_at.replace(second=0, microsecond=0)
-                + timedelta(minutes=1),
-            ).aggregate(total=Sum("quantity"))["total"]
-            or 0,
-            "resolution_seconds": max(
-                0,
-                int((trade.outcome.market.resolution_deadline - trade.created_at).total_seconds()),
+    if side == Order.Side.BUY:
+        house_positions = _house_inventory(house, outcomes) if house else {}
+        inventory_available = _inventory_available(house_positions.get(outcome.id))
+        max_quantity = min(
+            quantity,
+            _max_amm_buy_quantity(
+                market=market,
+                house_available_credits=house_available,
+                inventory_available=inventory_available,
             ),
-            "source_trade_id": trade.id,
+        )
+        user_wallet = Wallet.objects.filter(user=user).first()
+        max_cost = user_wallet.available_balance if user_wallet else 0
+        fill_quantity = max_buy_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=max_quantity,
+            max_cost=max_cost,
+        )
+        notional = buy_cost(net_shares, index, fill_quantity, market.liquidity_b)
+        limit_capacity = min(quantity, max_quantity)
+        limit_fill = max_buy_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=limit_capacity,
+        )
+        if fill_quantity < quantity and limit_fill < limit_capacity:
+            limited_by = "limit"
+        elif fill_quantity < quantity and max_quantity < quantity:
+            limited_by = "liquidity"
+        elif fill_quantity < quantity:
+            limited_by = "balance"
+        else:
+            limited_by = None
+        average = average_tick(notional, fill_quantity, side="buy") if fill_quantity else None
+    else:
+        position = Position.objects.filter(user=user, outcome=outcome).first()
+        available_shares = _inventory_available(position)
+        max_quantity = min(quantity, available_shares, net_shares[index])
+        max_refund = house_available
+        fill_quantity = max_sell_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=max_quantity,
+            max_refund=max_refund,
+        )
+        notional = sell_refund(net_shares, index, fill_quantity, market.liquidity_b)
+        limit_capacity = min(quantity, net_shares[index])
+        limit_fill = max_sell_quantity(
+            net_shares,
+            index,
+            market.liquidity_b,
+            limit_price=limit_price,
+            max_quantity=limit_capacity,
+        )
+        if fill_quantity < quantity and limit_fill < limit_capacity:
+            limited_by = "limit"
+        elif fill_quantity < quantity and available_shares < quantity:
+            limited_by = "position"
+        elif fill_quantity < quantity:
+            limited_by = "liquidity"
+        else:
+            limited_by = None
+        average = average_tick(notional, fill_quantity, side="sell") if fill_quantity else None
+
+    after = list(net_shares)
+    if fill_quantity:
+        after[index] += fill_quantity if side == Order.Side.BUY else -fill_quantity
+    after_ticks = lmsr_prices(after, market.liquidity_b)
+
+    return {
+        "outcome": outcome.id,
+        "outcome_name": outcome.name,
+        "market_id": market.id,
+        "market_slug": market.slug,
+        "side": side,
+        "requested_quantity": quantity,
+        "fillable_quantity": fill_quantity,
+        "notional": notional,
+        "notional_decimal": notional / CREDIT_SCALE,
+        "average_price": average,
+        "average_price_decimal": average / CREDIT_SCALE if average is not None else None,
+        "current_price": current_ticks[index],
+        "current_price_decimal": current_ticks[index] / CREDIT_SCALE,
+        "prices_after": {
+            str(item.id): tick for item, tick in zip(outcomes, after_ticks)
         },
-    )
+        "prices_after_decimal": {
+            str(item.id): tick / CREDIT_SCALE
+            for item, tick in zip(outcomes, after_ticks)
+        },
+        "limited_by": limited_by,
+    }
 
 
 @transaction.atomic
-def resolve_market(*, market_id, winning_outcome_id=None, is_void=False, resolved_by, evidence_summary, evidence_url=""):
+def resolve_market(
+    *,
+    market_id,
+    winning_outcome_id=None,
+    is_void=False,
+    resolved_by,
+    evidence_summary,
+    evidence_url="",
+):
     market = Market.objects.select_for_update().get(pk=market_id)
     existing = MarketResolution.objects.filter(market=market).first()
     if existing:
@@ -632,28 +877,109 @@ def settle_market(*, market_id):
             payload={"position_id": position.id, "payout": payout, "market_id": market.id},
         )
 
+    if not resolution.is_void:
+        _record_resolution_price_points(market=market, resolution=resolution)
+
+
+def _record_resolution_price_points(*, market, resolution):
+    bucket = timezone.now().replace(second=0, microsecond=0)
+    for outcome in market.outcomes.filter(is_active=True):
+        price = CREDIT_SCALE if outcome.pk == resolution.winning_outcome_id else 0
+        MarketPricePoint.objects.update_or_create(
+            outcome=outcome,
+            timestamp=bucket,
+            defaults={
+                "price": price,
+                "volume": 0,
+                "resolution_seconds": 0,
+                "source_trade_id": None,
+            },
+        )
+
 
 def get_order_book_depth(*, outcome_id, limit=20):
-    open_orders = Order.objects.filter(outcome_id=outcome_id).filter(_open_status_filter())
-    remaining = ExpressionWrapper(
-        F("original_quantity") - F("filled_quantity"),
-        output_field=BigIntegerField(),
+    """
+    Return synthetic AMM depth for an outcome.
+
+    The LMSR market maker has no resting user orders, so the book is derived
+    from the cost of buying or selling geometrically increasing quantities.
+    """
+    outcome = MarketOutcome.objects.select_related("market").get(pk=outcome_id)
+    market = outcome.market
+    outcomes = _active_outcomes(market)
+    if len(outcomes) < 2:
+        return {
+            "current_price": None,
+            "current_price_decimal": None,
+            "bids": [],
+            "asks": [],
+        }
+    index = _outcome_index(outcomes, outcome.id)
+    net_shares = _net_shares(outcomes)
+    resolution = getattr(market, "resolution", None)
+    if (
+        resolution is not None
+        and not resolution.is_void
+        and resolution.winning_outcome_id
+    ):
+        ticks = [
+            CREDIT_SCALE if item.pk == resolution.winning_outcome_id else 0
+            for item in outcomes
+        ]
+    else:
+        ticks = lmsr_prices(net_shares, market.liquidity_b)
+    house, house_wallet, house_available = _readonly_house()
+    if market.status != Market.Status.OPEN:
+        return {
+            "current_price": ticks[index],
+            "current_price_decimal": ticks[index] / CREDIT_SCALE,
+            "bids": [],
+            "asks": [],
+        }
+
+    house_positions = _house_inventory(house, outcomes) if house else {}
+    inventory_available = _inventory_available(house_positions.get(outcome.id))
+    max_ask = _max_amm_buy_quantity(
+        market=market,
+        house_available_credits=house_available,
+        inventory_available=inventory_available,
     )
-    bids = (
-        open_orders.filter(side=Order.Side.BUY)
-        .values("limit_price")
-        .annotate(quantity=Sum(remaining))
-        .order_by("-limit_price")[:limit]
+    max_bid = max_sell_quantity(
+        net_shares,
+        index,
+        market.liquidity_b,
+        limit_price=MIN_PRICE,
+        max_quantity=net_shares[index],
+        max_refund=house_available,
     )
-    asks = (
-        open_orders.filter(side=Order.Side.SELL)
-        .values("limit_price")
-        .annotate(quantity=Sum(remaining))
-        .order_by("limit_price")[:limit]
-    )
+
+    def levels(max_quantity, *, side):
+        rows = []
+        cumulative = 0
+        step = 1
+        previous = 0
+        while len(rows) < limit and cumulative < max_quantity:
+            quantity = min(step, max_quantity - cumulative)
+            new_cumulative = cumulative + quantity
+            if side == Order.Side.BUY:
+                total = buy_cost(net_shares, index, new_cumulative, market.liquidity_b)
+                incremental = total - previous
+                price = average_tick(incremental, quantity, side="buy")
+            else:
+                total = sell_refund(net_shares, index, new_cumulative, market.liquidity_b)
+                incremental = total - previous
+                price = average_tick(incremental, quantity, side="sell")
+            rows.append({"price": price, "quantity": quantity})
+            previous = total
+            cumulative = new_cumulative
+            step *= 2
+        return rows
+
     return {
-        "bids": [{"price": row["limit_price"], "quantity": row["quantity"]} for row in bids],
-        "asks": [{"price": row["limit_price"], "quantity": row["quantity"]} for row in asks],
+        "current_price": ticks[index],
+        "current_price_decimal": ticks[index] / CREDIT_SCALE,
+        "bids": levels(max_bid, side=Order.Side.SELL),
+        "asks": levels(max_ask, side=Order.Side.BUY),
     }
 
 
