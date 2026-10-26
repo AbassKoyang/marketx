@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.conf import settings
 from django.db.models import (
     BigIntegerField,
     Count,
@@ -23,6 +24,7 @@ from apps.trading.models import Order, Position, Trade
 from apps.trading.services import cancel_order
 from apps.wallet.models import Wallet, WalletLedgerEntry
 
+from .identity import house_filter
 from .serializers import (
     AdminLedgerEntrySerializer,
     AdminOrderSerializer,
@@ -50,6 +52,9 @@ def _subquery(queryset, field, output_field):
         Subquery(queryset.values(field), output_field=output_field),
         0,
     )
+
+
+HOUSE_EMAIL = settings.MARKETX_HOUSE_EMAIL
 
 
 def admin_user_queryset():
@@ -105,23 +110,45 @@ class AdminOverviewView(APIView):
         now = timezone.now()
         week_ago = now - timedelta(days=7)
         day_ago = now - timedelta(hours=24)
-        wallet_totals = Wallet.objects.aggregate(
+        customers = User.objects.exclude(house_filter())
+        customer_wallets = Wallet.objects.exclude(house_filter("user__"))
+        wallet_totals = customer_wallets.aggregate(
             available=Sum("available_balance"),
             reserved=Sum("reserved_balance"),
+        )
+        # Older databases can retain more than one liquidity account after the
+        # house identity was renamed, so the market-maker block aggregates every
+        # house account instead of only the configured one.
+        house_users = User.objects.filter(house_filter())
+        house_primary = (
+            house_users.select_related("wallet").filter(email=HOUSE_EMAIL).first()
+            or house_users.select_related("wallet").order_by("pk").first()
+        )
+        house_wallets = Wallet.objects.filter(house_filter("user__")).aggregate(
+            available=Sum("available_balance"),
+            reserved=Sum("reserved_balance"),
+        )
+        house_trade_filter = house_filter("buyer__") | house_filter("seller__")
+        house_order_filter = Q(client_order_id__startswith="amm:") | house_filter(
+            "user__"
         )
 
         return Response(
             {
+                # Customer counts exclude the inactive liquidity account. The
+                # market maker is reported separately below.
                 "users": {
-                    "total": User.objects.count(),
-                    "staff": User.objects.filter(is_staff=True).count(),
-                    "active": User.objects.filter(is_active=True).count(),
-                    "new_7d": User.objects.filter(
+                    "total": customers.count(),
+                    "staff": User.objects.filter(is_staff=True)
+                    .exclude(house_filter())
+                    .count(),
+                    "active": customers.filter(is_active=True).count(),
+                    "new_7d": customers.filter(
                         created_at__gte=week_ago
                     ).count(),
                 },
                 "wallets": {
-                    "total": Wallet.objects.count(),
+                    "total": customer_wallets.count(),
                     "available": wallet_totals["available"] or 0,
                     "reserved": wallet_totals["reserved"] or 0,
                 },
@@ -144,20 +171,40 @@ class AdminOverviewView(APIView):
                     ).count(),
                 },
                 "trading": {
+                    # Order and trade totals include market-maker activity.
                     "orders": Order.objects.count(),
+                    # Only legacy resting orders can still be open. A new
+                    # partial fill cancels its remainder immediately.
                     "open_orders": Order.objects.filter(
                         status__in=[
                             Order.Status.OPEN,
                             Order.Status.PARTIALLY_FILLED,
-                        ]
+                        ],
+                        cancelled_at__isnull=True,
                     ).count(),
                     "trades": Trade.objects.count(),
                     "trades_24h": Trade.objects.filter(
                         created_at__gte=day_ago
                     ).count(),
+                    # House inventory is AMM liquidity, not customer exposure.
                     "open_positions": Position.objects.filter(
                         quantity__gt=0
-                    ).count(),
+                    )
+                    .exclude(house_filter("user__"))
+                    .count(),
+                },
+                "market_maker": {
+                    "user_id": house_primary.pk if house_primary else None,
+                    "email": house_primary.email if house_primary else HOUSE_EMAIL,
+                    "username": house_primary.username if house_primary else None,
+                    "accounts": house_users.count(),
+                    "available_balance": house_wallets["available"] or 0,
+                    "reserved_balance": house_wallets["reserved"] or 0,
+                    "orders": Order.objects.filter(house_order_filter).count(),
+                    "trades": Trade.objects.filter(house_trade_filter).count(),
+                    "open_positions": Position.objects.filter(
+                        quantity__gt=0
+                    ).filter(house_filter("user__")).count(),
                 },
             }
         )
@@ -192,6 +239,12 @@ class AdminUserListView(generics.ListAPIView):
         onboarded = _flag(params.get("onboarded"))
         if onboarded is not None:
             queryset = queryset.filter(is_onboarded=onboarded)
+
+        market_maker = _flag(params.get("market_maker"))
+        if market_maker is True:
+            queryset = queryset.filter(house_filter())
+        elif market_maker is False:
+            queryset = queryset.exclude(house_filter())
 
         return queryset
 
@@ -232,6 +285,11 @@ class AdminWalletListView(generics.ListAPIView):
                 | Q(user__first_name__icontains=search)
                 | Q(user__last_name__icontains=search)
             )
+        market_maker = _flag(self.request.query_params.get("market_maker"))
+        if market_maker is True:
+            queryset = queryset.filter(house_filter("user__"))
+        elif market_maker is False:
+            queryset = queryset.exclude(house_filter("user__"))
         return queryset
 
 
@@ -275,6 +333,15 @@ class AdminOrderListView(generics.ListAPIView):
                 | Q(outcome__name__icontains=search)
                 | Q(outcome__market__title__icontains=search)
             )
+
+        market_maker = _flag(params.get("market_maker"))
+        house_order_filter = Q(client_order_id__startswith="amm:") | house_filter(
+            "user__"
+        )
+        if market_maker is True:
+            queryset = queryset.filter(house_order_filter)
+        elif market_maker is False:
+            queryset = queryset.exclude(house_order_filter)
 
         return queryset
 
@@ -326,6 +393,12 @@ class AdminPositionListView(generics.ListAPIView):
                 | Q(outcome__market__title__icontains=search)
             )
 
+        market_maker = _flag(params.get("market_maker"))
+        if market_maker is True:
+            queryset = queryset.filter(house_filter("user__"))
+        elif market_maker is False:
+            queryset = queryset.exclude(house_filter("user__"))
+
         return queryset
 
 
@@ -364,5 +437,12 @@ class AdminTradeListView(generics.ListAPIView):
                 | Q(outcome__name__icontains=search)
                 | Q(outcome__market__title__icontains=search)
             )
+
+        market_maker = _flag(params.get("market_maker"))
+        house_trade_filter = house_filter("buyer__") | house_filter("seller__")
+        if market_maker is True:
+            queryset = queryset.filter(house_trade_filter)
+        elif market_maker is False:
+            queryset = queryset.exclude(house_trade_filter)
 
         return queryset
