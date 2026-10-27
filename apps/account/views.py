@@ -88,7 +88,7 @@ def google_login(request):
         if created:
             user.set_unusable_password()
             user.save()
-            get_or_create_wallet(user, 10000)
+            get_or_create_wallet(user, 1_000_000)
         elif user.auth_provider != 'google':
             return Response({
                 "error": "User needs to sign in through email",

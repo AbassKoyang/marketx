@@ -3,9 +3,6 @@
 from django.conf import settings
 from django.db.models import Q
 
-# The configured house identities plus aliases created by earlier defaults.
-# Local and long-lived databases can contain more than one liquidity account
-# after the house email was renamed, and none of them are customers.
 HOUSE_EMAILS = {
     settings.MARKETX_HOUSE_EMAIL,
     "liquidity@marketx.local",

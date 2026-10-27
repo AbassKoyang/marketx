@@ -135,7 +135,7 @@ def _mutate_wallet(
 
 
 @transaction.atomic
-def get_or_create_wallet(user, initial_credits=10_000):
+def get_or_create_wallet(user, initial_credits=1_000_000):
     """
     Get a user's wallet, creating it and allocating starter credits
     only if the initial-credit operation has not already occurred.
