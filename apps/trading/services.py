@@ -9,6 +9,8 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from apps.markets.models import Market, MarketOutcome, MarketPricePoint, MarketResolution
+from apps.notifications.models import Notification
+from apps.notifications.services import notify_user, notify_users
 from apps.wallet.models import Wallet
 from apps.wallet.services import (
     consume_reserved_credits,
@@ -543,6 +545,161 @@ def _record_price_vector(*, market, outcomes, trade):
         )
 
 
+def _format_credits(amount):
+    return f"{amount / CREDIT_SCALE:,.2f}"
+
+
+def _format_price(tick):
+    return f"{tick / CREDIT_SCALE:.2f}"
+
+
+def _notify_order_filled(*, user, trade, market, outcome, user_order):
+    is_partial = trade.quantity < user_order.original_quantity
+    side_label = "Buy" if user_order.side == Order.Side.BUY else "Sell"
+    title = "Order partially filled" if is_partial else "Order filled"
+    body = (
+        f"{side_label} {trade.quantity:,} {outcome.name} shares at "
+        f"{_format_price(trade.price)} for {_format_credits(trade.notional)} credits."
+    )
+    if is_partial:
+        cancelled = user_order.original_quantity - trade.quantity
+        body = (
+            f"{side_label} order partially filled: {trade.quantity:,} of "
+            f"{user_order.original_quantity:,} {outcome.name} shares at "
+            f"{_format_price(trade.price)} for {_format_credits(trade.notional)} "
+            f"credits. {cancelled:,} unfilled shares were cancelled."
+        )
+    notify_user(
+        user=user,
+        event_type=Notification.EventType.ORDER_FILLED,
+        title=title,
+        body=body,
+        data={
+            "trade_id": trade.id,
+            "order_id": user_order.id,
+            "side": user_order.side,
+            "quantity": trade.quantity,
+            "original_quantity": user_order.original_quantity,
+            "partial": is_partial,
+            "price": trade.price,
+            "price_decimal": trade.price / CREDIT_SCALE,
+            "notional": trade.notional,
+            "notional_decimal": trade.notional / CREDIT_SCALE,
+            "market_id": market.id,
+            "market_slug": market.slug,
+            "market_title": market.title,
+            "outcome_id": outcome.id,
+            "outcome_name": outcome.name,
+        },
+    )
+
+
+def _notify_order_cancelled(*, order, remaining):
+    side_label = "buy" if order.side == Order.Side.BUY else "sell"
+    body = (
+        f"Your {side_label} order for {order.original_quantity:,} "
+        f"{order.outcome.name} shares was cancelled."
+    )
+    if remaining:
+        if order.side == Order.Side.BUY:
+            body += (
+                f" {_format_credits(order.limit_price * remaining)} reserved "
+                "credits were released."
+            )
+        else:
+            body += f" {remaining:,} shares were released."
+    notify_user(
+        user=order.user,
+        event_type=Notification.EventType.ORDER_CANCELLED,
+        title="Order cancelled",
+        body=body,
+        data={
+            "order_id": order.id,
+            "side": order.side,
+            "original_quantity": order.original_quantity,
+            "filled_quantity": order.filled_quantity,
+            "released_quantity": remaining,
+            "market_id": order.outcome.market_id,
+            "outcome_id": order.outcome_id,
+            "outcome_name": order.outcome.name,
+        },
+    )
+
+
+def _notify_market_closed(*, market, extra_user_ids=()):
+    user_ids = set(extra_user_ids)
+    user_ids.update(
+        Position.objects.filter(outcome__market=market, quantity__gt=0)
+        .exclude(user__email=settings.MARKETX_HOUSE_EMAIL)
+        .values_list("user_id", flat=True)
+    )
+    house_user_id = (
+        get_user_model()
+        .objects.filter(email=settings.MARKETX_HOUSE_EMAIL)
+        .values_list("id", flat=True)
+        .first()
+    )
+    user_ids.discard(house_user_id)
+    if not user_ids:
+        return
+    notify_users(
+        user_ids=list(user_ids),
+        event_type=Notification.EventType.MARKET_CLOSED,
+        title=f"Market closed: {market.title}"[:180],
+        body=(
+            "Trading has ended. Your positions will be settled when the "
+            "market is resolved."
+        ),
+        data={
+            "market_id": market.id,
+            "market_slug": market.slug,
+            "market_title": market.title,
+        },
+    )
+
+
+def _notify_position_settled(*, position, market, resolution, payout):
+    outcome = position.outcome
+    won = not resolution.is_void and position.outcome_id == resolution.winning_outcome_id
+    if resolution.is_void:
+        title = "Market voided"
+        body = (
+            f"{market.title} was voided. Your {outcome.name} position was "
+            f"refunded {_format_credits(payout)} credits."
+        )
+    elif won:
+        title = "Winning position settled"
+        body = (
+            f"Your {outcome.name} position in {market.title} won and paid "
+            f"{_format_credits(payout)} credits."
+        )
+    else:
+        title = "Position settled"
+        body = (
+            f"Your {outcome.name} position in {market.title} did not win. "
+            f"Payout: {_format_credits(payout)} credits."
+        )
+    notify_user(
+        user=position.user,
+        event_type=Notification.EventType.POSITION_SETTLED,
+        title=title,
+        body=body,
+        data={
+            "position_id": position.id,
+            "market_id": market.id,
+            "market_slug": market.slug,
+            "market_title": market.title,
+            "outcome_id": outcome.id,
+            "outcome_name": outcome.name,
+            "payout": payout,
+            "payout_decimal": payout / CREDIT_SCALE,
+            "is_void": resolution.is_void,
+            "winning_outcome_id": resolution.winning_outcome_id,
+            "won": won,
+        },
+    )
+
+
 def _record_trade_events(*, trade, market, outcomes, user_order, user_id, user_is_buyer):
     ticks = lmsr_prices(_net_shares(outcomes), market.liquidity_b)
     price_vector = {
@@ -573,13 +730,20 @@ def _record_trade_events(*, trade, market, outcomes, user_order, user_id, user_i
             "notional": trade.notional,
         },
     )
+    _notify_order_filled(
+        user=user_order.user,
+        trade=trade,
+        market=market,
+        outcome=trade.outcome,
+        user_order=user_order,
+    )
 
 
 @transaction.atomic
 def cancel_order(*, user, order_id):
     order = (
         Order.objects.select_for_update()
-        .select_related("outcome")
+        .select_related("outcome", "user")
         .get(pk=order_id, user=user)
     )
     return _cancel_locked_order(order)
@@ -599,6 +763,7 @@ def _cancel_locked_order(order):
         outcome_id=order.outcome_id,
         payload={"order_id": order.id, "released_quantity": remaining},
     )
+    _notify_order_cancelled(order=order, remaining=remaining)
 
     if remaining:
         if order.side == Order.Side.BUY:
@@ -631,10 +796,13 @@ def close_market(*, market_id):
         .select_related("outcome", "user")
         .order_by("id")
     )
+    open_order_user_ids = set()
     for order in open_orders:
+        open_order_user_ids.add(order.user_id)
         _cancel_locked_order(order)
     market.status = Market.Status.CLOSED
     market.save(update_fields=["status", "updated_at"])
+    _notify_market_closed(market=market, extra_user_ids=open_order_user_ids)
     return market
 
 
@@ -876,6 +1044,13 @@ def settle_market(*, market_id):
             outcome_id=position.outcome_id,
             payload={"position_id": position.id, "payout": payout, "market_id": market.id},
         )
+        if position.user.email != settings.MARKETX_HOUSE_EMAIL:
+            _notify_position_settled(
+                position=position,
+                market=market,
+                resolution=resolution,
+                payout=payout,
+            )
 
     if not resolution.is_void:
         _record_resolution_price_points(market=market, resolution=resolution)

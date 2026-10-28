@@ -204,7 +204,11 @@ USE_I18N = True
 USE_TZ = True
 
 
-FIREBASE_CREDENTIALS_PATH = os.path.join(BASE_DIR, 'firebase-credentials.json')
+FIREBASE_CREDENTIALS_PATH = config(
+    "FIREBASE_CREDENTIALS_PATH",
+    default=os.path.join(BASE_DIR, "firebase-credentials.json"),
+)
+FIREBASE_CREDENTIALS_JSON = config("FIREBASE_CREDENTIALS_JSON", default="")
 GOOGLE_OAUTH_CLIENT_ID = config('GOOGLE_OAUTH_CLIENT_ID', default='')
 GOOGLE_OAUTH_CLIENT_SECRET = config('GOOGLE_OAUTH_CLIENT_SECRET', default='')
 CLOUDINARY_CLOUD_NAME = config("CLOUDINARY_CLOUD_NAME", default="")

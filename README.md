@@ -128,9 +128,25 @@ Wallet:
 
 Notifications:
 
+- `GET /api/notifications/` (supports `?unread=true` and `?event_type=order_filled`)
+- `GET /api/notifications/unread-count/`
+- `POST /api/notifications/{id}/read/`
+- `POST /api/notifications/mark-all-read/`
 - `POST /api/notifications/devices/`
 - `GET /api/notifications/devices/`
 - `DELETE /api/notifications/devices/{id}/`
+
+In-app notifications are persisted for order fills and partial fills, order
+cancellations, market close, and position settlement. Each notification is
+pushed to the user's active registered devices through Firebase Cloud
+Messaging after the surrounding database transaction commits. Push delivery is
+best effort: missing Firebase credentials or device tokens do not fail the
+underlying trading operation, and unregistered tokens are deactivated
+automatically.
+
+For client integration examples (device registration, feed pagination, read
+state, and push handling), see
+[`docs/notifications-client-guide.md`](docs/notifications-client-guide.md).
 
 Market administration:
 
@@ -177,6 +193,12 @@ See `.env.example` for placeholders. Keep real `.env` files and Firebase
 credentials out of git. `GOOGLE_OAUTH_CLIENT_ID`, Firebase credentials, and
 Cloudinary credentials are optional for tests and local API startup unless the
 corresponding integration is exercised.
+
+Firebase push delivery reads `FIREBASE_CREDENTIALS_PATH` or
+`FIREBASE_CREDENTIALS_JSON`. If neither is configured, it also looks for
+`firebase-credentials.json` at the project root or in `config/`. When no
+credentials or device tokens are available, notifications are still stored
+in-app and push delivery is skipped without failing the request.
 
 The platform liquidity account used by the market maker is configured with
 `MARKETX_HOUSE_EMAIL`, `MARKETX_HOUSE_USERNAME`, and `MARKETX_HOUSE_CREDITS`.
