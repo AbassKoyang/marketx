@@ -97,10 +97,6 @@ positions, and cash.
 
 Authentication routes remain under `/api/auth/`.
 
-For a frontend-agent-ready admin dashboard contract, including endpoint
-payloads, TanStack Query guidance, and shadcn/ui design direction, see
-[`docs/admin-dashboard-api-guide.md`](docs/admin-dashboard-api-guide.md).
-
 Market discovery:
 
 - `GET /api/categories/`
@@ -143,10 +139,6 @@ Messaging after the surrounding database transaction commits. Push delivery is
 best effort: missing Firebase credentials or device tokens do not fail the
 underlying trading operation, and unregistered tokens are deactivated
 automatically.
-
-For client integration examples (device registration, feed pagination, read
-state, and push handling), see
-[`docs/notifications-client-guide.md`](docs/notifications-client-guide.md).
 
 Market administration:
 
